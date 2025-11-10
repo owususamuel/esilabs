@@ -1,0 +1,51 @@
+# Agent behavior configuration
+agents:
+  # Paper Parser Agent - extracts info from PDFs
+  paper_parser:
+    model_temperature: 0.3  # Lower temp for precise extraction
+    max_tokens: 1024
+    
+  # Repo Finder Agent - searches for repositories
+  repo_finder:
+    model_temperature: 0.5
+    max_tokens: 512
+    search_providers:
+      - github
+    
+  # Experiment Runner Agent - orchestrates code execution
+  experiment_runner:
+    model_temperature: 0.7
+    max_tokens: 2048
+    timeout_seconds: 300
+    
+  # Evaluator Agent - assesses reproducibility
+  evaluator:
+    model_temperature: 0.3
+    max_tokens: 1024
+
+# Tool configurations
+tools:
+  pdf_parser:
+    supported_formats:
+      - pdf
+    extract_sections:
+      - abstract
+      - introduction
+      - methodology
+      - experiments
+      - results
+  
+  github_search:
+    max_results: 10
+    sort_by: "stars"
+    
+  code_executor:
+    sandbox_mode: true
+    max_execution_time: 300
+    allowed_file_types:
+      - py
+      - sh
+      - txt
+    restricted_commands:
+      - "rm -rf /"
+      - "sudo"
