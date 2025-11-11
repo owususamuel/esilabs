@@ -7,10 +7,42 @@ import fitz  # PyMuPDF
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
+import io
+from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Figure:
+    """Represents a figure/image extracted from the paper."""
+    image_data: bytes
+    page_number: int
+    caption: Optional[str] = None
+    figure_number: Optional[str] = None
+    bbox: Optional[Tuple[float, float, float, float]] = None  # (x0, y0, x1, y1)
+
+
+@dataclass
+class Table:
+    """Represents a table extracted from the paper."""
+    content: str  # Table as text
+    page_number: int
+    caption: Optional[str] = None
+    table_number: Optional[str] = None
+    bbox: Optional[Tuple[float, float, float, float]] = None
+    metrics: Optional[Dict[str, float]] = None  # Extracted numerical metrics
+
+
+@dataclass
+class ExperimentalResults:
+    """Container for all experimental results extracted from the paper."""
+    results_text: str  # Text from results/experiments section
+    figures: List[Figure] = field(default_factory=list)
+    tables: List[Table] = field(default_factory=list)
+    metrics_mentioned: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -22,6 +54,7 @@ class PDFContent:
     abstract: Optional[str]
     sections: Dict[str, str]
     metadata: Dict[str, str]
+    experimental_results: Optional[ExperimentalResults] = None
 
 
 class PDFParser:
@@ -209,6 +242,238 @@ class PDFParser:
         urls = list(dict.fromkeys(cleaned_urls))  # preserve order, remove duplicates
         
         return urls
+    
+    def extract_figures(self, pdf_path: str) -> List[Figure]:
+        """Extract all figures/images from the PDF with their captions."""
+        pdf_path = Path(pdf_path)
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        
+        figures = []
+        
+        try:
+            document = fitz.open(pdf_path)
+            
+            for page_num in range(len(document)):
+                page = document[page_num]
+                page_text = page.get_text()
+                
+                # Extract images from page
+                image_list = page.get_images(full=True)
+                
+                for img_index, img in enumerate(image_list):
+                    try:
+                        xref = img[0]
+                        base_image = document.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        
+                        # Filter out small images (likely icons/logos)
+                        # Check image dimensions
+                        try:
+                            pil_img = Image.open(io.BytesIO(image_bytes))
+                            width, height = pil_img.size
+                            # Skip small images (likely not figures)
+                            if width < 100 or height < 100:
+                                continue
+                        except Exception:
+                            continue
+                        
+                        # Try to find caption near this image
+                        caption = self._find_figure_caption(page_text, img_index)
+                        
+                        # Extract figure number if present
+                        figure_number = None
+                        if caption:
+                            fig_match = re.search(r'(?i)(?:figure|fig\.?)\s*(\d+)', caption)
+                            if fig_match:
+                                figure_number = fig_match.group(1)
+                        
+                        figures.append(Figure(
+                            image_data=image_bytes,
+                            page_number=page_num + 1,
+                            caption=caption,
+                            figure_number=figure_number,
+                            bbox=None  # Could extract from page.get_image_bbox if needed
+                        ))
+                    except Exception as e:
+                        self.logger.warning(f"Failed to extract image {img_index} from page {page_num + 1}: {e}")
+                        continue
+            
+            document.close()
+            self.logger.info(f"Extracted {len(figures)} figures from PDF")
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting figures: {e}")
+        
+        return figures
+    
+    def _find_figure_caption(self, page_text: str, img_index: int) -> Optional[str]:
+        """Try to find the caption for a figure on the page."""
+        # Look for common caption patterns
+        caption_patterns = [
+            r'(?i)(figure\s+\d+[:\.]?\s*[^\n]+(?:\n[^\n]+){0,3})',
+            r'(?i)(fig\.\s+\d+[:\.]?\s*[^\n]+(?:\n[^\n]+){0,3})',
+        ]
+        
+        for pattern in caption_patterns:
+            matches = re.findall(pattern, page_text)
+            if matches and img_index < len(matches):
+                return matches[img_index].strip()
+        
+        return None
+    
+    def extract_tables(self, pdf_path: str) -> List[Table]:
+        """Extract tables from the PDF with their captions."""
+        pdf_path = Path(pdf_path)
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        
+        tables = []
+        
+        try:
+            document = fitz.open(pdf_path)
+            
+            for page_num in range(len(document)):
+                page = document[page_num]
+                page_text = page.get_text()
+                
+                # Find table captions and extract surrounding content
+                table_pattern = r'(?i)table\s+(\d+)[:\.]?\s*([^\n]+(?:\n(?!(?:figure|table|section|\d+\.))[^\n]+){0,20})'
+                table_matches = re.finditer(table_pattern, page_text)
+                
+                for match in table_matches:
+                    table_number = match.group(1)
+                    caption = match.group(2).strip()
+                    
+                    # Extract table content (text after caption until next section/table)
+                    start_pos = match.end()
+                    # Look for next major delimiter
+                    next_section = re.search(r'(?i)\n(?:figure|table|section|\d+\.)', page_text[start_pos:])
+                    end_pos = start_pos + (next_section.start() if next_section else min(1000, len(page_text) - start_pos))
+                    
+                    table_content = page_text[start_pos:end_pos].strip()
+                    
+                    if table_content:
+                        # Try to extract structured metrics from table
+                        table_metrics = self._extract_table_metrics(table_content)
+                        
+                        tables.append(Table(
+                            content=table_content,
+                            page_number=page_num + 1,
+                            caption=caption,
+                            table_number=table_number,
+                            bbox=None,
+                            metrics=table_metrics
+                        ))
+            
+            document.close()
+            self.logger.info(f"Extracted {len(tables)} tables from PDF")
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting tables: {e}")
+        
+        return tables
+    
+    def _extract_table_metrics(self, table_text: str) -> Dict[str, float]:
+        """Extract numerical metrics from table text."""
+        import re
+        
+        metrics = {}
+        lines = table_text.split('\n')
+        
+        for line in lines:
+            # Look for patterns like "Method: 0.95" or "Accuracy 89.5%"
+            # Match metric name followed by number
+            pattern = r'([A-Za-z][\\w\\s-]+?)\\s*[:\\s]+\\s*([0-9]+\\.?[0-9]*%?)'
+            matches = re.finditer(pattern, line)
+            
+            for match in matches:
+                metric_name = match.group(1).strip()
+                value_str = match.group(2).replace('%', '')
+                
+                try:
+                    value = float(value_str)
+                    # Convert percentages to decimals if > 1
+                    if '%' in match.group(2) and value > 1:
+                        value = value / 100
+                    metrics[metric_name] = value
+                except ValueError:
+                    continue
+        
+        return metrics
+    
+    def extract_evaluation_metrics(self, text: str) -> List[str]:
+        """Extract common evaluation metrics mentioned in the paper."""
+        metrics = []
+        
+        # Common ML/AI evaluation metrics
+        metric_patterns = [
+            r'\b(accuracy|acc)\b',
+            r'\b(precision)\b',
+            r'\b(recall)\b',
+            r'\b(f1[- ]score|f1)\b',
+            r'\b(auc|auroc|roc)\b',
+            r'\b(mean average precision|map|mAP)\b',
+            r'\b(bleu|rouge|meteor)\b',
+            r'\b(perplexity|ppl)\b',
+            r'\b(mean squared error|mse|rmse)\b',
+            r'\b(mean absolute error|mae)\b',
+            r'\b(r2[- ]score|r²|r-squared)\b',
+            r'\b(iou|intersection over union)\b',
+            r'\b(dice coefficient|dice score)\b',
+        ]
+        
+        for pattern in metric_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                # Extract the metric name
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    metric = match.group(1)
+                    if metric.lower() not in [m.lower() for m in metrics]:
+                        metrics.append(metric)
+        
+        return metrics
+    
+    def extract_experimental_results(self, pdf_path: str) -> ExperimentalResults:
+        """
+        Extract all experimental results from the paper:
+        - Results section text
+        - Figures and plots
+        - Tables
+        - Mentioned evaluation metrics
+        """
+        # Parse the PDF
+        content = self.parse_pdf(pdf_path)
+        
+        # Extract results section text
+        results_text = ""
+        for section_name in ['results', 'experiments', 'experimental_results']:
+            if section_name in content.sections:
+                results_text += content.sections[section_name] + "\n\n"
+        
+        if not results_text:
+            results_text = content.sections.get('evaluation', '')
+        
+        # Extract figures (plots, charts, visualizations)
+        figures = self.extract_figures(pdf_path)
+        
+        # Extract tables
+        tables = self.extract_tables(pdf_path)
+        
+        # Extract mentioned metrics
+        metrics = self.extract_evaluation_metrics(content.full_text)
+        
+        self.logger.info(
+            f"Extracted experimental results: {len(figures)} figures, "
+            f"{len(tables)} tables, {len(metrics)} metrics"
+        )
+        
+        return ExperimentalResults(
+            results_text=results_text,
+            figures=figures,
+            tables=tables,
+            metrics_mentioned=metrics
+        )
 
 
 def extract_paper_metadata(pdf_path: str) -> Dict[str, any]:

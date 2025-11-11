@@ -3,25 +3,23 @@ agents:
   # Paper Parser Agent - extracts info from PDFs
   paper_parser:
     model_temperature: 0.3  # Lower temp for precise extraction
-    max_tokens: 1024
+    max_tokens: 10000
     
-  # Repo Finder Agent - searches for repositories
+  # Repo Finder Agent - helps find repositories
   repo_finder:
     model_temperature: 0.5
     max_tokens: 512
-    search_providers:
-      - github
     
   # Experiment Runner Agent - orchestrates code execution
   experiment_runner:
     model_temperature: 0.7
-    max_tokens: 2048
+    max_tokens: 10000
     timeout_seconds: 300
     
   # Evaluator Agent - assesses reproducibility
   evaluator:
     model_temperature: 0.3
-    max_tokens: 1024
+    max_tokens: 10000
 
 # Tool configurations
 tools:
@@ -35,10 +33,6 @@ tools:
       - experiments
       - results
   
-  github_search:
-    max_results: 10
-    sort_by: "stars"
-    
   code_executor:
     sandbox_mode: true
     max_execution_time: 300

@@ -1,7 +1,7 @@
 
 import logging
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 import json
 from datetime import datetime
@@ -13,6 +13,7 @@ from scientist.agents.evaluator_agent import EvaluatorAgent
 from scientist.utils.logging_config import setup_logging
 from scientist.utils.data_models import PipelineRun, PaperData
 from scientist.utils.interactive import InteractiveInputHandler
+from scientist.utils.report_generator import ReportGenerator
 
 
 class ReproducibilityOrchestrator:
@@ -39,6 +40,9 @@ class ReproducibilityOrchestrator:
         
         # Initialize interactive handler for manual input fallback
         self.interactive_handler = InteractiveInputHandler()
+        
+        # Initialize report generator
+        self.report_generator = ReportGenerator()
         
         self.current_run = None
     
@@ -91,34 +95,15 @@ class ReproducibilityOrchestrator:
             self.logger.info("STAGE 2: Finding Repository")
             self.logger.info("="*50)
             
-            # Step 1: Check if GitHub URL was found directly in paper
             repo_url = None
             repo_path = None
             github_url_from_paper = paper_data_dict.get('github_url', '')
             
-            # Validate it's actually a URL, not descriptive text
             is_valid_url = (
                 github_url_from_paper and 
-                (github_url_from_paper.startswith(('http://', 'https://')) or
-                 '/' in github_url_from_paper and not ' ' in github_url_from_paper)  # Allow "user/repo" format
+                'github.com' in github_url_from_paper.lower() and
+                github_url_from_paper.startswith(('http://', 'https://'))
             )
-            
-            # Fallback: use any directly extracted URLs from PDF parsing
-            if not is_valid_url:
-                urls_in_paper = parsing_result.get('github_urls_found') or []
-                if urls_in_paper:
-                    candidate = urls_in_paper[0]
-                    # Verify it's actually a GitHub URL
-                    if 'github.com' in candidate.lower() and (candidate.startswith(('http://', 'https://')) or ('/' in candidate and ' ' not in candidate)):
-                        github_url_from_paper = candidate
-                        is_valid_url = True
-            
-            # Final validation: ensure it's a GitHub URL
-            if is_valid_url and github_url_from_paper:
-                # Double-check it's actually GitHub
-                if 'github.com' not in github_url_from_paper.lower():
-                    self.logger.warning(f"URL found but not a GitHub URL: {github_url_from_paper}")
-                    is_valid_url = False
             
             if is_valid_url:
                 self.logger.info(f"✓ GitHub URL found in paper: {github_url_from_paper}")
@@ -175,7 +160,8 @@ class ReproducibilityOrchestrator:
             eval_result = self._stage_evaluate_results(
                 exp_result,
                 paper_data,
-                original_results_output
+                original_results_output,
+                parsing_result.get('figures')
             )
             self.current_run.evaluation_status = "completed" if eval_result['success'] else "failed"
             self.current_run.evaluation = eval_result
@@ -330,7 +316,7 @@ class ReproducibilityOrchestrator:
             )
             
             if result['success']:
-                self.logger.info(f"✓ Experiment completed successfully")
+                self.logger.info("✅ Experiment completed successfully")
                 if result.get('duration_seconds'):
                     self.logger.info(f"  Duration: {result['duration_seconds']:.1f}s")
                 if result.get('exit_code') is not None:
@@ -353,7 +339,8 @@ class ReproducibilityOrchestrator:
         self,
         experiment_result: Dict[str, Any],
         paper_data: PaperData,
-        original_output: Optional[str]
+        original_output: Optional[str],
+        paper_figures: Optional[List[Dict[str, Any]]]
     ) -> Dict[str, Any]:
         """Execute evaluation stage."""
         
@@ -387,6 +374,7 @@ class ReproducibilityOrchestrator:
                 'reproduced_output': reproduced_text,
                 'original_output': original_text,
                 'output_directory': output_directory,
+                'paper_figures': paper_figures or []
             }
             
             result = self.evaluator.execute(eval_config)
@@ -434,37 +422,89 @@ class ReproducibilityOrchestrator:
             'pipeline': self.current_run.model_dump() if self.current_run else None
         }
     
-    def save_report(self, output_path: str = None) -> str:
-        """Save pipeline results to file."""
+    def save_report(
+        self, 
+        output_path: str = None,
+        generate_visualizations: bool = True,
+        generate_full_report: bool = True
+    ) -> Dict[str, str]:
+        """
+        Save pipeline results with comprehensive reporting.
         
+        Args:
+            output_path: Optional custom output path for JSON report
+            generate_visualizations: Whether to create charts/graphs
+            generate_full_report: Whether to generate full report package
+            
+        Returns:
+            Dictionary of generated file paths
+        """
         if not output_path:
             output_path = f"./data/outputs/report_{self.current_run.run_id}.json"
         
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         
-        report = {
+        report_data = {
             'run_id': self.current_run.run_id,
             'timestamp': datetime.now().isoformat(),
             'pipeline': self.current_run.model_dump()
         }
         
+        # Save basic JSON report
         with open(output_path, 'w') as f:
-            json.dump(report, f, indent=2, default=str)
+            json.dump(report_data, f, indent=2, default=str)
         
-        self.logger.info(f"Report saved to: {output_path}")
+        self.logger.info(f"JSON report saved to: {output_path}")
         
-        return output_path
+        generated_files = {'json': output_path}
+        
+        # Generate comprehensive report package if requested
+        if generate_full_report:
+            try:
+                self.logger.info("Generating comprehensive report package...")
+                report_files = self.report_generator.generate_full_report(
+                    run_data=report_data,
+                    run_id=self.current_run.run_id,
+                    create_visualizations=generate_visualizations
+                )
+                generated_files.update(report_files)
+                
+                self.logger.info(f"✓ Report package complete: {len(generated_files)} files generated")
+                self.logger.info(f"  → View dashboard: {report_files.get('dashboard', 'N/A')}")
+                
+            except Exception as e:
+                self.logger.error(f"Error generating full report: {e}", exc_info=True)
+                self.logger.info("Continuing with basic JSON report...")
+        
+        return generated_files
 
 
 def run_reproducibility_pipeline(
     pdf_path: str,
     original_results: Optional[str] = None,
-    output_report: bool = True
+    output_report: bool = True,
+    generate_visualizations: bool = True
 ) -> Dict[str, Any]:
+    """
+    Run the full reproducibility pipeline.
+    
+    Args:
+        pdf_path: Path to research paper PDF
+        original_results: Optional original results text
+        output_report: Whether to save reports
+        generate_visualizations: Whether to create charts/graphs
+        
+    Returns:
+        Pipeline execution results with generated file paths
+    """
     orchestrator = ReproducibilityOrchestrator()
-    result = orchestrator.run_pipeline(pdf_path, original_results, output_report=output_report)
+    result = orchestrator.run_pipeline(pdf_path, original_results)
     
     if output_report and result.get('success'):
-        orchestrator.save_report()
+        report_files = orchestrator.save_report(
+            generate_visualizations=generate_visualizations,
+            generate_full_report=True
+        )
+        result['report_files'] = report_files
     
     return result

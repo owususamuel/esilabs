@@ -37,7 +37,6 @@ class PaperData(BaseModel):
 class ExperimentConfig(BaseModel):
     
     repo_url: str
-    repo_branch: Optional[str] = "main"
     working_directory: str
     
     # Execution details

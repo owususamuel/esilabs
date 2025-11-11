@@ -23,8 +23,6 @@ env/
 
 # Project Data & Outputs
 data/temp/
-data/outputs/
-data/inputs/
 *.log
 
 # Cache

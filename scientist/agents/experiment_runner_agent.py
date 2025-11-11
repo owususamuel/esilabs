@@ -5,6 +5,7 @@ import re
 import shutil
 import hashlib
 import shlex
+import time
 from typing import Dict, Any, Optional, List, TYPE_CHECKING
 from pathlib import Path
 from datetime import datetime
@@ -20,7 +21,8 @@ from scientist.tools.tool_wrappers import (
     ListDirectoryFiles,
     RunCommandInRepo,
     CreateFileOrDirectory,
-    ExtractMetrics
+    ExtractMetrics,
+    RequestCredentials
 )
 
 
@@ -80,172 +82,94 @@ class ExperimentRunnerAgent(BaseAgent):
         from scientist.tools.tool_wrappers import ExtractMetrics
         self.create_tool = CreateFileOrDirectory()
         self.extract_metrics_tool = ExtractMetrics(self.comparator, llm_client=self.model)
+        self.request_credentials_tool = RequestCredentials()
         
         self.register_tool("read_file_contents", None, self.read_file_tool)
         self.register_tool("list_directory_files", None, self.list_dir_tool)
         self.register_tool("extract_metrics", None, self.extract_metrics_tool)
         self.register_tool("run_command_in_repo", None, self.run_command_tool)
         self.register_tool("create_file_or_directory", None, self.create_tool)
+        self.register_tool("request_credentials", None, self.request_credentials_tool)
         
         # Store reference to interactive handler (will be set in execute)
         self._interactive_handler = None
         
         # Ensure cache directory exists
         self.VENV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Detect what's available on the system
+        self._has_uv = self._check_command("uv --version")
+        self._has_pip3 = self._check_command("pip3 --version")
+        
+        # Detect how Python should be invoked on this system
+        self._python_invocation = self._detect_python_invocation()
+    
+    def _check_command(self, cmd: str) -> bool:
+        """Check if a command is available."""
+        try:
+            return self.executor.execute_command(cmd).success
+        except Exception:
+            return False
+    
+    def _detect_python_invocation(self) -> str:
+        """
+        Detect how Python should be invoked on the host system.
+        Tries various methods and returns the working command.
+        """
+        # Priority order: uv run, python3, python
+        candidates = [
+            ("uv run python", "uv run python --version"),
+            ("python3", "python3 --version"),
+            ("python", "python --version"),
+        ]
+        
+        for invocation, test_cmd in candidates:
+            if self._check_command(test_cmd):
+                self.logger.info(f"Detected Python invocation method: {invocation}")
+                return invocation
+        
+        # Fallback to python3 if nothing works
+        self.logger.warning("Could not detect Python invocation, defaulting to 'python3'")
+        return "python3"
     
     def check_environment_requirements(self, repo_path: Path) -> Dict[str, Any]:
         
         self.logger.info(f"Checking environment requirements for {repo_path}")
         
         required_vars = []
-        found_in = []
-        
-        # Common patterns for environment variables
-        env_patterns = [
-            r'export\s+([A-Z_][A-Z0-9_]*)\s*=',  # export VAR=
-            r'\$\{?([A-Z_][A-Z0-9_]*)\}?',       # ${VAR} or $VAR
-            r'os\.getenv\([\'"]([A-Z_][A-Z0-9_]*)[\'"]',  # os.getenv("VAR")
-            r'os\.environ\[[\'"]([A-Z_][A-Z0-9_]*)[\'"]',  # os.environ["VAR"]
-        ]
-        
-        # API key patterns to prioritize
-        api_key_patterns = [
-            'API_KEY', 'TOKEN', 'SECRET', 'CREDENTIALS',
-            'OPENAI', 'ANTHROPIC', 'HF_', 'AZURE', 'GITHUB'
-        ]
+        missing_vars = []
         
         try:
-            # 1. Check README files
-            readme_files = list(repo_path.glob('README*')) + list(repo_path.glob('readme*'))
-            for readme in readme_files:
-                if readme.is_file():
-                    try:
-                        content = readme.read_text(encoding='utf-8', errors='ignore')
-                        
-                        # Find all environment variables
-                        env_vars = set()
-                        for pattern in env_patterns:
-                            matches = re.findall(pattern, content, re.MULTILINE)
-                            env_vars.update(matches)
-                        
-                        # Filter for API keys and important vars
-                        for var in env_vars:
-                            if any(key_pattern in var for key_pattern in api_key_patterns):
-                                # Try to extract description from surrounding text
-                                desc = self._extract_var_description(content, var)
-                                required_vars.append({
-                                    'key': var,
-                                    'description': desc
-                                })
-                        
-                        if env_vars:
-                            found_in.append(str(readme.name))
-                    
-                    except Exception as e:
-                        self.logger.warning(f"Error reading {readme}: {e}")
-            
-            # 2. Check .env.example file
             env_example = repo_path / '.env.example'
             if env_example.exists():
-                try:
-                    content = env_example.read_text(encoding='utf-8', errors='ignore')
-                    for line in content.splitlines():
-                        line = line.strip()
-                        if line and not line.startswith('#') and '=' in line:
-                            key = line.split('=')[0].strip()
-                            if key and any(pattern in key for pattern in api_key_patterns):
-                                # Check if not already added
-                                if not any(v['key'] == key for v in required_vars):
-                                    # Extract comment as description
-                                    desc = ''
-                                    comment_match = re.search(r'#\s*(.+)$', line)
-                                    if comment_match:
-                                        desc = comment_match.group(1).strip()
-                                    
-                                    required_vars.append({
-                                        'key': key,
-                                        'description': desc or 'See .env.example'
-                                    })
-                    
-                    if required_vars:
-                        found_in.append('.env.example')
-                
-                except Exception as e:
-                    self.logger.warning(f"Error reading .env.example: {e}")
-            
-            # 3. Check which variables are actually missing
-            missing_vars = []
-            for var_info in required_vars:
-                key = var_info['key']
-                if not os.getenv(key):
-                    missing_vars.append(key)
-            
-            result = {
-                'required_vars': required_vars,
-                'missing_vars': missing_vars,
-                'found_in': found_in,
-                'has_missing': len(missing_vars) > 0
-            }
+                content = env_example.read_text(encoding='utf-8', errors='ignore')
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key = line.split('=')[0].strip()
+                        if key:
+                            required_vars.append({'key': key, 'description': ''})
+                            if not os.getenv(key):
+                                missing_vars.append(key)
             
             if missing_vars:
                 self.logger.warning(f"Missing environment variables: {missing_vars}")
-            else:
-                self.logger.info("All required environment variables are set")
             
-            return result
+            return {
+                'required_vars': required_vars,
+                'missing_vars': missing_vars,
+                'found_in': ['.env.example'] if required_vars else [],
+                'has_missing': len(missing_vars) > 0
+            }
         
         except Exception as e:
-            self.logger.error(f"Error checking environment requirements: {e}", exc_info=True)
+            self.logger.error(f"Error checking environment requirements: {e}")
             return {
                 'required_vars': [],
                 'missing_vars': [],
                 'found_in': [],
-                'has_missing': False,
-                'error': str(e)
+                'has_missing': False
             }
-    
-    def _extract_var_description(self, content: str, var_name: str) -> str:
-        
-        try:
-            # Look for lines mentioning the variable
-            lines = content.split('\n')
-            for i, line in enumerate(lines):
-                if var_name in line:
-                    # Check surrounding lines for description
-                    context = []
-                    
-                    # Previous line
-                    if i > 0:
-                        prev = lines[i-1].strip()
-                        if prev and not prev.startswith('#') and len(prev) < 100:
-                            context.append(prev)
-                    
-                    # Current line
-                    current = line.strip()
-                    if ':' in current or '-' in current:
-                        parts = re.split(r'[:\-]', current, 1)
-                        if len(parts) > 1:
-                            context.append(parts[1].strip())
-                    
-                    # Next line
-                    if i < len(lines) - 1:
-                        next_line = lines[i+1].strip()
-                        if next_line and not next_line.startswith(var_name) and len(next_line) < 100:
-                            context.append(next_line)
-                    
-                    if context:
-                        desc = ' '.join(context)
-                        # Clean up
-                        desc = re.sub(r'export\s+\w+\s*=.*', '', desc)
-                        desc = re.sub(r'\$\{?\w+\}?', '', desc)
-                        desc = desc.strip()
-                        if desc and len(desc) > 10:
-                            return desc[:150]  # Limit length
-            
-            return ''
-        
-        except Exception:
-            return ''
     
     def _copy_local_repo(self, source_path: str) -> Optional[Path]:
         try:
@@ -292,13 +216,12 @@ class ExperimentRunnerAgent(BaseAgent):
                 return None
             
             content = requirements_file.read_text()
-            # Normalize: sort lines, strip whitespace, ignore comments/empty lines
             lines = [line.strip() for line in content.splitlines() 
                     if line.strip() and not line.strip().startswith('#')]
             normalized = '\n'.join(sorted(lines))
             
             hash_obj = hashlib.sha256(normalized.encode())
-            return hash_obj.hexdigest()[:16]  # Use first 16 chars
+            return hash_obj.hexdigest()[:16]
             
         except Exception as e:
             self.logger.warning(f"Failed to hash requirements: {e}")
@@ -316,13 +239,8 @@ class ExperimentRunnerAgent(BaseAgent):
                 if not specified_path.is_absolute():
                     specified_path = repo_path / specified_path
                 if specified_path.exists():
-                    self.logger.info(
-                        f"Using specified requirements file: {specified_path.relative_to(repo_path)}"
-                        if specified_path.is_relative_to(repo_path)
-                        else f"Using specified requirements file: {specified_path}"
-                    )
+                    self.logger.info(f"Using specified requirements file: {specified_path.name}")
                     return specified_path
-                self.logger.warning(f"Specified requirements file not found: {specified_path}")
             
             default_path = repo_path / "requirements.txt"
             if default_path.exists():
@@ -339,13 +257,11 @@ class ExperimentRunnerAgent(BaseAgent):
             if matches:
                 matches.sort(key=lambda p: (len(p.relative_to(repo_path).parts), str(p)))
                 chosen = matches[0]
-                self.logger.info(
-                    f"Found nested requirements file: {chosen.relative_to(repo_path)}"
-                )
+                self.logger.info(f"Found nested requirements file: {chosen.relative_to(repo_path)}")
                 return chosen
         
         except Exception as e:
-            self.logger.warning(f"Failed to resolve requirements file: {e}", exc_info=True)
+            self.logger.warning(f"Failed to resolve requirements file: {e}")
         
         return None
     
@@ -358,72 +274,56 @@ class ExperimentRunnerAgent(BaseAgent):
         try:
             requirements_file = self._resolve_requirements_file(repo_path, requirements_spec)
             
-            # If no requirements.txt, create empty venv in repo
             if not requirements_file:
                 self.logger.info("No requirements file found, creating empty venv in repo")
                 venv_path = repo_path / ".venv"
-                result = self.executor.execute_command(
-                    f"uv venv {venv_path}",
-                    working_directory=str(repo_path)
-                )
-                if result.success:
-                    return venv_path
-                return None
+                cmd = f"uv venv {venv_path}" if self._has_uv else f"python3 -m venv {venv_path}"
+                result = self.executor.execute_command(cmd, working_directory=str(repo_path))
+                return venv_path if result.success else None
             
-            # Hash requirements for caching
             req_hash = self._hash_requirements(requirements_file)
             if not req_hash:
                 self.logger.warning("Failed to hash requirements, creating non-cached venv")
                 venv_path = repo_path / ".venv"
-                result = self.executor.execute_command(
-                    f"uv venv {venv_path}",
-                    working_directory=str(repo_path)
-                )
-                if result.success:
-                    return venv_path
-                return None
+                cmd = f"uv venv {venv_path}" if self._has_uv else f"python3 -m venv {venv_path}"
+                result = self.executor.execute_command(cmd, working_directory=str(repo_path))
+                return venv_path if result.success else None
             
-            # Check for cached venv
             cached_venv_path = self.VENV_CACHE_DIR / f"venv_{req_hash}"
             
             if cached_venv_path.exists():
                 self.logger.info(f"♻️  Reusing cached venv: {req_hash}")
-                # Copy cached venv into repository .venv to avoid symlink permission issues
                 venv_dir = repo_path / ".venv"
                 if venv_dir.exists():
                     shutil.rmtree(venv_dir, ignore_errors=True)
                 shutil.copytree(cached_venv_path, venv_dir, symlinks=True)
                 return venv_dir
             
-            # Create new venv in cache
             self.logger.info(f"🆕 Creating new cached venv: {req_hash}")
             cached_venv_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Create venv in cache location
-            result = self.executor.execute_command(
-                f"uv venv {cached_venv_path}",
-                working_directory=str(repo_path)
-            )
-            
+            # Create venv
+            cmd = f"uv venv {cached_venv_path}" if self._has_uv else f"python3 -m venv {cached_venv_path}"
+            result = self.executor.execute_command(cmd, working_directory=str(repo_path))
             if not result.success:
                 self.logger.error(f"Failed to create venv: {result.stderr}")
                 return None
             
-            # Install requirements into cached venv
+            # Install requirements
             self.logger.info(f"📦 Installing requirements into cached venv...")
-            python_path = cached_venv_path / "bin" / "python"
-            requirements_arg = shlex.quote(str(requirements_file))
-            python_arg = shlex.quote(str(python_path))
-            install_result = self.executor.execute_command(
-                f"uv pip install --python {python_arg} -r {requirements_arg}",
-                working_directory=str(repo_path)
-            )
+            req_file = shlex.quote(str(requirements_file))
             
+            if self._has_uv:
+                python = shlex.quote(str(cached_venv_path / "bin" / "python"))
+                install_cmd = f"uv pip install --python {python} -r {req_file}"
+            else:
+                pip = shlex.quote(str(cached_venv_path / "bin" / "pip"))
+                install_cmd = f"{pip} install -r {req_file}"
+            
+            install_result = self.executor.execute_command(install_cmd, working_directory=str(repo_path))
             if not install_result.success:
                 self.logger.warning(f"Failed to install requirements: {install_result.stderr}")
-                # Keep the venv anyway, might be partial success
             
-            # Copy cached venv into repository
             venv_dir = repo_path / ".venv"
             if venv_dir.exists():
                 shutil.rmtree(venv_dir, ignore_errors=True)
@@ -482,8 +382,11 @@ class ExperimentRunnerAgent(BaseAgent):
 
         # Store interactive handler for use by tools during execution
         self._interactive_handler = interactive_handler
-        if interactive_handler and hasattr(self.run_command_tool, 'set_interactive_handler'):
-            self.run_command_tool.set_interactive_handler(interactive_handler)
+        if interactive_handler:
+            if hasattr(self.run_command_tool, 'set_interactive_handler'):
+                self.run_command_tool.set_interactive_handler(interactive_handler)
+            if hasattr(self.request_credentials_tool, 'set_interactive_handler'):
+                self.request_credentials_tool.set_interactive_handler(interactive_handler)
 
         # Prompt for missing environment variables/API keys before continuing
         # The LLM intelligently scans README and .env.example to detect requirements
@@ -506,7 +409,6 @@ class ExperimentRunnerAgent(BaseAgent):
         
         requirements_spec = task.get('requirements_file')
         
-        # Setup cached venv for this experiment (hybrid approach)
         self.logger.info("🔧 Setting up isolated venv with smart caching...")
         venv_path = self._get_or_create_cached_venv(repo_path, requirements_spec)
         if venv_path:
@@ -515,23 +417,18 @@ class ExperimentRunnerAgent(BaseAgent):
             self.logger.warning("⚠️  Failed to create venv, will try without it")
         
         try:
-            self.logger.info(f"🤖 Autonomous agent analyzing repository: {repo_path}")
+            start_time = time.time()
             
-            # Determine Python interpreter and guidance for dependency installation
+            self.logger.info(f"Autonomous agent analyzing repository: {repo_path}")
+            
             if venv_path and (Path(venv_path) / "bin" / "python").exists():
                 python_cmd = str((Path(venv_path) / "bin" / "python").resolve())
-                venv_info = f"✅ Isolated venv is already set up at {repo_path}/.venv"
-                install_note = (
-                    "Install or update dependencies using 'uv pip install ...' from the repository root "
-                    "(never plain pip). Example: uv pip install -r requirements.txt or uv pip install package_name."
-                )
+                venv_info = f"Virtual environment available at {repo_path}/.venv (PATH configured)"
+                install_note = "uv is available for package management" if self._has_uv else "Standard pip available"
             else:
-                python_cmd = "python3"
-                venv_info = "⚠️  No venv available, fall back to system Python"
-                install_note = (
-                    "If dependencies are missing, run 'uv pip install ...' from the repository directory "
-                    "to ensure required packages are available."
-                )
+                python_cmd = self._python_invocation  # Use detected invocation method
+                venv_info = f"Using system Python (invoked via: {python_cmd})"
+                install_note = "uv is available for package management" if self._has_uv else "Standard pip available"
             
             # Load task prompt from YAML
             task_prompt_template = BaseAgent._load_task_prompt('experiment_runner_agent')
@@ -542,98 +439,37 @@ class ExperimentRunnerAgent(BaseAgent):
                 )
             
             # Fill in template variables
-            agent_task = task_prompt_template.format(
-                repo_path=repo_path,
-                venv_info=venv_info,
-                python_cmd=python_cmd,
-                install_note=install_note
+            agent_task = BaseAgent._render_template(
+                task_prompt_template,
+                {
+                    "repo_path": str(repo_path),
+                    "venv_info": venv_info,
+                    "python_cmd": python_cmd,
+                    "install_note": install_note,
+                }
             )
             
-            # Agent works autonomously
             self.logger.info("Agent is now exploring the repository and running experiments...")
             agent_response = self.call_llm(agent_task)
             
-            self.logger.info(f"✅ Agent completed autonomous execution")
+            duration_seconds = time.time() - start_time
+            
+            self.logger.info(f"Agent completed autonomous execution in {duration_seconds:.1f}s")
             
             execution_data = self._parse_execution_response(agent_response)
 
             if execution_data:
-                # Extract command from recommended_command or executed_commands
                 command_ran = execution_data.get('recommended_command', '')
-                executed_commands = execution_data.get('executed_commands', [])
+                exit_code = execution_data.get('exit_code')
+                stdout_text = execution_data.get('stdout_snippet', '')
+                stderr_text = execution_data.get('stderr_snippet', '')
+                metrics = execution_data.get('metrics_extracted', {})
+                artifacts = self._detect_artifacts(repo_path)
                 
-                # Find the main experiment command (not pip install)
-                exit_code = None
-                stdout_text = ''
-                stderr_text = ''
-                success_flag = False
-                
-                for cmd_info in executed_commands:
-                    if isinstance(cmd_info, dict):
-                        cmd = cmd_info.get('command', '')
-                        if 'pip install' not in cmd and 'uv pip install' not in cmd:
-                            # This is the main experiment command
-                            success_flag = cmd_info.get('succeeded', False)
-                            exit_code = cmd_info.get('exit_code', None)
-                            stdout_text = cmd_info.get('stdout_snippet', '')
-                            stderr_text = cmd_info.get('stderr_snippet', '')
-                            if not command_ran:
-                                command_ran = cmd
-                
-                if not command_ran:
-                    command_ran = execution_data.get('command_executed', command_ran)
-                
-                if exit_code is None:
-                    exit_code = execution_data.get('exit_code', exit_code)
-                
-                if not stdout_text:
-                    stdout_text = execution_data.get('stdout_snippet', stdout_text)
-                
-                if not stderr_text:
-                    stderr_text = execution_data.get('stderr_snippet', stderr_text)
-                
-                if not success_flag and execution_data.get('succeeded') is not None:
-                    success_flag = bool(execution_data.get('succeeded'))
-                
-                # Extract metrics from metrics_extracted field
-                raw_metrics = execution_data.get('metrics_extracted', {})
-                metrics: Dict[str, Any] = {}
-                
-                if isinstance(raw_metrics, dict):
-                    # Get best_performing_configurations and flatten to simple metrics
-                    best_configs = raw_metrics.get('best_performing_configurations', {})
-                    if best_configs:
-                        for retriever, config_data in best_configs.items():
-                            if isinstance(config_data, dict):
-                                metrics[f'{retriever}_recall@10'] = config_data.get('Recall@10', 0)
-                                metrics[f'{retriever}_mrr'] = config_data.get('MRR', 0)
-                    
-                    # Also get example detailed results
-                    example_results = raw_metrics.get('example_detailed_results_sentence_minimal', {})
-                    if example_results:
-                        for method, method_metrics in example_results.items():
-                            if isinstance(method_metrics, dict):
-                                for key, value in method_metrics.items():
-                                    metrics[f'{method}_{key}'] = value
-                    
-                    # If no metrics extracted, try the raw dict
-                    if not metrics and raw_metrics:
-                        metrics = raw_metrics
-
-                # Set success based on exit code if available
+                success_flag = execution_data.get('succeeded', False)
                 if exit_code == 0:
                     success_flag = True
-                
-                # CRITICAL FIX: If metrics were extracted, consider it a success
-                # This handles cases where exit_code isn't captured but experiment ran successfully
-                if metrics and len(metrics) > 0:
-                    self.logger.info(f"✅ Metrics extracted successfully ({len(metrics)} metrics) - marking as success")
-                    success_flag = True
-                
-                # Additional check: If agent completed without explicit failure and returned structured data, assume success
-                if not success_flag and execution_data and not execution_data.get('error') and not execution_data.get('failed'):
-                    # Agent completed execution and returned structured output without errors
-                    self.logger.info("✅ Agent completed execution with structured output - assuming success")
+                if metrics:
                     success_flag = True
 
                 result = {
@@ -647,12 +483,11 @@ class ExperimentRunnerAgent(BaseAgent):
                     'stdout': stdout_text,
                     'stderr': stderr_text,
                     'metrics': metrics,
-                    'duration_seconds': None,  # Agent doesn't provide this in current format
+                    'artifacts': artifacts,
+                    'duration_seconds': duration_seconds,
                     'agent_response': agent_response,
                     'execution_data': execution_data,
-                    'issues_encountered': execution_data.get('issues_encountered'),
-                    'execution_type': 'autonomous',
-                    'note': 'All experiments run in data/temp/experiments for isolation. Agent autonomously explored repo, determined how to run code, and executed experiments.'
+                    'execution_type': 'autonomous'
                 }
             else:
                 result = {
@@ -661,6 +496,7 @@ class ExperimentRunnerAgent(BaseAgent):
                     'original_repo_path': str(original_path) if original_path else None,
                     'repo_url': repo_url,
                     'work_dir': str(self.WORK_DIR),
+                    'duration_seconds': duration_seconds,
                     'agent_response': agent_response,
                     'error': 'Could not parse structured execution data from agent response',
                     'execution_type': 'autonomous',
@@ -685,214 +521,73 @@ class ExperimentRunnerAgent(BaseAgent):
     ) -> None:
 
         missing_vars = env_check.get('missing_vars', [])
-        required_vars = env_check.get('required_vars', [])
         if not missing_vars:
             return
 
-        self.logger.warning(f"Missing environment variables detected: {missing_vars}")
-
-        found_in = ', '.join(env_check.get('found_in', [])) or 'repository files'
-        print("\n" + "=" * 60)
-        print("⚠️  REQUIRED ENVIRONMENT VARIABLES MISSING")
-        print("=" * 60)
-        print(f"\nThese variables were referenced in: {found_in}\n")
-
-        var_lookup = {item['key']: item for item in required_vars}
-        for key in missing_vars:
-            info = var_lookup.get(key, {})
-            description = info.get('description') or 'No description provided.'
-            print(f"  ❌ {key}")
-            if description:
-                print(f"     {description}")
-
-        print("\nWithout these values the experiment may fail or skip crucial steps.\n")
+        self.logger.warning(f"Missing environment variables: {missing_vars}")
+        print("\n⚠️  Missing environment variables:", ", ".join(missing_vars))
+        print("The experiment may fail without these values.\n")
 
         provided: Dict[str, str] = {}
         if interactive_handler:
             if interactive_handler.confirm("Provide the missing keys now?"):
+                required_vars = env_check.get('required_vars', [])
+                var_lookup = {item['key']: item for item in required_vars}
                 prompt_keys = [var_lookup[k] for k in missing_vars if k in var_lookup]
                 provided = interactive_handler.prompt_for_api_keys(prompt_keys)
-            else:
-                print("⚠️  Continuing without API keys (experiment may fail)\n")
         else:
             try:
                 import getpass
-                print("Enter the values now, or press Enter to skip a key.")
                 for key in missing_vars:
-                    while True:
-                        value = getpass.getpass(f"{key}: ")
-                        if not value:
-                            print(f"  Skipped {key}")
-                            break
-                        if len(value.strip()) < 5:
-                            print("  Value seems too short. Try again or leave blank to skip.")
-                            continue
+                    value = getpass.getpass(f"{key} (press Enter to skip): ")
+                    if value and len(value.strip()) >= 5:
                         provided[key] = value.strip()
-                        print(f"  ✓ {key} captured")
-                        break
-                print()
             except Exception:
-                print("Unable to securely capture input; skipping prompt.")
+                pass
 
         if provided:
             for key, value in provided.items():
                 os.environ[key] = value
-            self.logger.info(f"Captured and set {len(provided)} environment variable(s)")
+            self.logger.info(f"Set {len(provided)} environment variable(s)")
             print(f"✅ Set {len(provided)} environment variable(s)\n")
-        else:
-            self.logger.warning("No environment variables provided; proceeding without them.")
     
-    @staticmethod
-    def _extract_structured_block(agent_response: str) -> Optional[str]:
-        """Extract a JSON/Python dict-like block from the agent response."""
+    @classmethod
+    def _parse_execution_response(cls, agent_response: Any) -> Optional[Dict[str, Any]]:
+        """Parse the agent's final_answer() response.
+        
+        smolagents CodeAgent returns the result from final_answer() directly as a dict.
+        """
         if not agent_response:
             return None
-    
-        def extract_from_index(text: str, start_index: int) -> Optional[str]:
-            brace_count = 0
-            in_string: Optional[str] = None
-            escape_next = False
-    
-            for idx in range(start_index, len(text)):
-                char = text[idx]
-    
-                if escape_next:
-                    escape_next = False
-                    continue
-    
-                if char == '\\':
-                    escape_next = True
-                    continue
-    
-                if in_string:
-                    if char == in_string:
-                        in_string = None
-                    continue
-    
-                if char in ('"', "'"):
-                    in_string = char
-                    continue
-    
-                if char == '{':
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        return text[start_index:idx + 1]
-    
-            return None
-    
-        final_match = re.search(r'Final answer:\s*(\{)', agent_response, re.IGNORECASE)
-        if final_match:
-            block = extract_from_index(agent_response, final_match.start(1))
-            if block:
-                return block
         
-        final_func_match = re.search(r'final_answer\s*\(\s*(\{)', agent_response, re.IGNORECASE)
-        if final_func_match:
-            block = extract_from_index(agent_response, final_func_match.start(1))
-            if block:
-                return block
-    
-        code_block_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', agent_response)
-        if code_block_match:
-            return code_block_match.group(1)
-    
-        for brace_match in re.finditer(r'\{', agent_response):
-            block = extract_from_index(agent_response, brace_match.start())
-            if block:
-                return block
-    
-        return None
-    
-    @staticmethod
-    def _sanitize_block_for_literal(block: str) -> str:
-        """Sanitize JSON-like block for literal evaluation."""
-        sanitized_chars = []
-        in_single = False
-        in_double = False
-        escape_next = False
-    
-        for char in block:
-            if escape_next:
-                sanitized_chars.append(char)
-                escape_next = False
-                continue
-    
-            if char == '\\':
-                sanitized_chars.append(char)
-                escape_next = True
-                continue
-    
-            if in_single:
-                if char == "'":
-                    in_single = False
-                    sanitized_chars.append(char)
-                elif char in ('\n', '\r'):
-                    sanitized_chars.append('\\n')
-                else:
-                    sanitized_chars.append(char)
-                continue
-    
-            if in_double:
-                if char == '"':
-                    in_double = False
-                    sanitized_chars.append(char)
-                elif char in ('\n', '\r'):
-                    sanitized_chars.append('\\n')
-                else:
-                    sanitized_chars.append(char)
-                continue
-    
-            if char == "'":
-                in_single = True
-            elif char == '"':
-                in_double = True
-    
-            sanitized_chars.append(char)
-    
-        return ''.join(sanitized_chars)
-    
-    @classmethod
-    def _parse_structured_dict(cls, block: str) -> Optional[Dict[str, Any]]:
-        """Parse structured data from the extracted block."""
-        if not block:
-            return None
-    
-        try:
-            return json.loads(block)
-        except json.JSONDecodeError:
-            pass
-    
-        sanitized_block = cls._sanitize_block_for_literal(block)
-    
-        try:
-            return json.loads(sanitized_block)
-        except json.JSONDecodeError:
-            pass
-    
-        for candidate in (sanitized_block, block):
+        # smolagents returns the dict directly from final_answer()
+        if isinstance(agent_response, dict):
+            return agent_response
+        
+        # If it's a string, try to parse it as JSON
+        if isinstance(agent_response, str):
             try:
-                parsed = ast.literal_eval(candidate)
-                if isinstance(parsed, dict):
-                    return parsed
-            except (ValueError, SyntaxError, MemoryError):
-                continue
-    
+                return json.loads(agent_response)
+            except json.JSONDecodeError:
+                pass
+            
+            # If wrapped in markdown code block, extract it
+            json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', agent_response)
+            if json_match:
+                try:
+                    return json.loads(json_match.group(1))
+                except json.JSONDecodeError:
+                    pass
+            
+            # Last resort: find JSON object in response
+            brace_match = re.search(r'\{[\s\S]*\}', agent_response)
+            if brace_match:
+                try:
+                    return json.loads(brace_match.group(0))
+                except json.JSONDecodeError:
+                    pass
+        
         return None
-    
-    @classmethod
-    def _parse_execution_response(cls, agent_response: str) -> Optional[Dict[str, Any]]:
-        """Parse the agent's final response into structured execution data."""
-        structured_block = cls._extract_structured_block(agent_response)
-        if not structured_block:
-            return None
-    
-        parsed = cls._parse_structured_dict(structured_block)
-        if not parsed:
-            return None
-    
-        return parsed
     
     def _clone_repository(self, repo_url: str, branch: Optional[str] = None) -> Optional[Path]:
         """Clone a repository to the temp experiments directory."""
@@ -907,23 +602,77 @@ class ExperimentRunnerAgent(BaseAgent):
             final_path = self.WORK_DIR / dest_name
             
             self.logger.info(f"Cloning repository: {repo_url}")
+            self.logger.info(f"Target directory: {final_path}")
+            self.logger.info(f"Branch: {branch or 'main'}")
+            
             clone_result = self.executor.clone_repository(
                 repo_url,
-                str(final_path),
-                branch=branch or 'main'
+                str(final_path)
             )
             
+            # Handle ExecutionResult object
             clone_success = clone_result.get('success') if isinstance(clone_result, dict) else clone_result.success
+            
             if clone_success:
-                self.logger.info(f"Repository cloned to: {final_path}")
+                self.logger.info(f"Repository cloned successfully to: {final_path}")
                 return final_path
             else:
-                self.logger.error("Failed to clone repository")
+                error_msg = f"Failed to clone repository"
+                if hasattr(clone_result, 'stderr') and clone_result.stderr:
+                    error_msg += f": {clone_result.stderr}"
+                if hasattr(clone_result, 'error_message') and clone_result.error_message:
+                    error_msg += f" ({clone_result.error_message})"
+                self.logger.error(error_msg)
                 return None
         except Exception as e:
-            self.logger.error(f"Error cloning repository: {e}")
+            self.logger.error(f"Error cloning repository: {e}", exc_info=True)
             return None
 
+
+    def _detect_artifacts(self, output_dir: Path) -> Dict[str, Any]:
+        
+        figures: List[Dict[str, Any]] = []
+        tables: List[Dict[str, Any]] = []
+        
+        try:
+            if not output_dir.exists():
+                return {'output_dir': str(output_dir), 'figures': figures, 'tables': tables}
+            
+            image_exts = {'.png', '.jpg', '.jpeg', '.svg', '.pdf', '.eps'}
+            table_exts = {'.csv', '.tsv', '.json', '.xlsx'}
+            
+            for item in output_dir.rglob('*'):
+                if not item.is_file():
+                    continue
+                suffix = item.suffix.lower()
+                if suffix in image_exts:
+                    try:
+                        rel_path = str(item.relative_to(output_dir))
+                    except Exception:
+                        rel_path = str(item)
+                    figures.append({
+                        'path': rel_path,
+                        'extension': suffix,
+                        'size_bytes': item.stat().st_size
+                    })
+                elif suffix in table_exts:
+                    try:
+                        rel_path = str(item.relative_to(output_dir))
+                    except Exception:
+                        rel_path = str(item)
+                    tables.append({
+                        'path': rel_path,
+                        'extension': suffix,
+                        'size_bytes': item.stat().st_size
+                    })
+        except Exception as e:
+            self.logger.warning(f"Artifact detection error: {e}")
+        
+        return {
+            'output_dir': str(output_dir),
+            'figures': figures,
+            'tables': tables
+        }
 
 def run_experiment(
     repo_path: Optional[str] = None,

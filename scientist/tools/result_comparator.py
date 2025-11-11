@@ -249,9 +249,11 @@ Output:
         
         try:
             # Use the correct method for smolagents models
-            # The model object is an AzureOpenAIServerModel which uses __call__
+            # The model object is an AzureOpenAIServerModel which expects messages array
             if hasattr(llm_client, '__call__'):
-                response = llm_client(prompt)
+                # OpenAI/Azure models expect messages in array format
+                messages = [{"role": "user", "content": prompt}]
+                response = llm_client(messages)
             elif hasattr(llm_client, 'invoke'):
                 response = llm_client.invoke(prompt)
             else:

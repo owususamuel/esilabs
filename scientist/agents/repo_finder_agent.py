@@ -5,18 +5,17 @@ from typing import Dict, Any, Optional
 
 from scientist.agents.base_agent import BaseAgent
 from scientist.tools.github_search import RepositoryFinder
-from scientist.tools.tool_wrappers import SearchGitHub
 
 
 class RepoFinderAgent(BaseAgent):
     """
-    Autonomous agent that finds the best repository for a research paper.
+    Agent that helps identify potential repositories for a research paper.
     
     The agent autonomously:
-    1. Searches GitHub for matching repositories
-    2. Analyzes repository metadata (stars, descriptions, authors)
-    3. Reasons about which is most likely the official implementation
-    4. Returns the best match with confidence score
+    1. Generates search queries from paper metadata
+    2. Builds GitHub search URLs
+    3. Provides queries and URLs for manual repository searching
+    4. Returns search assistance with reasoning
     """
     
     def __init__(self, config_path: str = "config/agent_config.yaml"):        
@@ -37,10 +36,7 @@ class RepoFinderAgent(BaseAgent):
         )
         
         # Initialize backing tools
-        self.github_finder = RepositoryFinder()
-        
-        # Register autonomous tools
-        self.register_tool("search_github", None, SearchGitHub(self.github_finder))
+        self.query_builder = RepositoryFinder()
     
     def execute(self, task: Dict[str, Any]) -> Dict[str, Any]:
         
@@ -70,17 +66,20 @@ class RepoFinderAgent(BaseAgent):
                 )
             
             # Fill in template variables
-            agent_task = task_prompt_template.format(
-                paper_title=paper_title,
-                author_str=author_str,
-                keyword_str=keyword_str
+            agent_task = BaseAgent._render_template(
+                task_prompt_template,
+                {
+                    "paper_title": paper_title,
+                    "author_str": author_str,
+                    "keyword_str": keyword_str
+                }
             )
             
             # Agent works autonomously
-            self.logger.info("Agent is now searching GitHub and analyzing repositories...")
+            self.logger.info("Agent is now generating search queries for repository discovery...")
             agent_response = self.call_llm(agent_task)
             
-            self.logger.info("✅ Agent completed autonomous repository search")
+            self.logger.info("✅ Agent completed search query generation")
             
             # Extract structured data from agent response
             structured_block = self._extract_structured_block(agent_response)
@@ -126,150 +125,53 @@ class RepoFinderAgent(BaseAgent):
             }
     
     @staticmethod
-    def _extract_structured_block(agent_response: str) -> Optional[str]:
-        """
-        Extract the first balanced JSON/Python dict-like block from the agent response.
-        Prefers blocks following 'Final answer:' but falls back to any balanced braces.
-        """
-        
+    def _extract_structured_block(agent_response: Any) -> Optional[Any]:
+        """Extract data from agent's final_answer() response."""
         if not agent_response:
             return None
         
-        def extract_from_index(text: str, start_index: int) -> Optional[str]:
-            brace_count = 0
-            in_string: Optional[str] = None
-            escape_next = False
+        # smolagents returns dict directly from final_answer()
+        if isinstance(agent_response, dict):
+            return agent_response
+        
+        # If string, try to extract JSON
+        if isinstance(agent_response, str):
+            # Try markdown code block
+            code_block_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', agent_response)
+            if code_block_match:
+                return code_block_match.group(1)
             
-            for idx in range(start_index, len(text)):
-                char = text[idx]
-                
-                if escape_next:
-                    escape_next = False
-                    continue
-                
-                if char == '\\':
-                    escape_next = True
-                    continue
-                
-                if in_string:
-                    if char == in_string:
-                        in_string = None
-                    elif char in ('\n', '\r'):
-                        # Strings can span lines; keep state
-                        pass
-                    continue
-                
-                if char in ('"', "'"):
-                    in_string = char
-                    continue
-                
-                if char == '{':
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        return text[start_index:idx + 1]
-            
-            return None
-        
-        final_match = re.search(r'Final answer:\s*(\{)', agent_response, re.IGNORECASE)
-        if final_match:
-            block = extract_from_index(agent_response, final_match.start(1))
-            if block:
-                return block
-        
-        code_block_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', agent_response)
-        if code_block_match:
-            return code_block_match.group(1)
-        
-        for brace_match in re.finditer(r'\{', agent_response):
-            block = extract_from_index(agent_response, brace_match.start())
-            if block:
-                return block
+            # Try to find JSON object
+            json_match = re.search(r'\{[\s\S]*\}', agent_response)
+            if json_match:
+                return json_match.group(0)
         
         return None
     
     @staticmethod
-    def _sanitize_block_for_literal(block: str) -> str:
-        """
-        Convert multiline strings within single/double quotes to use explicit newline escape sequences.
-        This helps ast.literal_eval handle strings that the LLM emitted across multiple lines.
-        """
-        
-        sanitized_chars = []
-        in_single = False
-        in_double = False
-        escape_next = False
-        
-        for char in block:
-            if escape_next:
-                sanitized_chars.append(char)
-                escape_next = False
-                continue
-            
-            if char == '\\':
-                sanitized_chars.append(char)
-                escape_next = True
-                continue
-            
-            if in_single:
-                if char == "'":
-                    in_single = False
-                    sanitized_chars.append(char)
-                elif char in ('\n', '\r'):
-                    sanitized_chars.append('\\n')
-                else:
-                    sanitized_chars.append(char)
-                continue
-            
-            if in_double:
-                if char == '"':
-                    in_double = False
-                    sanitized_chars.append(char)
-                elif char in ('\n', '\r'):
-                    sanitized_chars.append('\\n')
-                else:
-                    sanitized_chars.append(char)
-                continue
-            
-            if char == "'":
-                in_single = True
-            elif char == '"':
-                in_double = True
-            
-            sanitized_chars.append(char)
-        
-        return ''.join(sanitized_chars)
-    
-    @staticmethod
-    def _parse_structured_dict(block: str) -> Optional[Dict[str, Any]]:
-        """
-        Attempt to parse the extracted structured block into a dictionary.
-        Handles both JSON and Python literal formats, including multiline strings.
-        """
-        
+    def _parse_structured_dict(block: Any) -> Optional[Dict[str, Any]]:
+        """Parse data from agent response."""
         if not block:
             return None
         
-        try:
-            return json.loads(block)
-        except json.JSONDecodeError:
-            pass
+        # Already a dict
+        if isinstance(block, dict):
+            return block
         
-        sanitized_block = RepoFinderAgent._sanitize_block_for_literal(block)
-        
-        try:
-            return json.loads(sanitized_block)
-        except json.JSONDecodeError:
-            pass
-        
-        for candidate in (sanitized_block, block):
+        # Try JSON parsing
+        if isinstance(block, str):
             try:
-                parsed = ast.literal_eval(candidate)
+                return json.loads(block)
+            except json.JSONDecodeError:
+                pass
+            
+            # Fallback to ast.literal_eval
+            try:
+                parsed = ast.literal_eval(block)
                 if isinstance(parsed, dict):
                     return parsed
             except (ValueError, SyntaxError, MemoryError):
-                continue
+                pass
         
         return None
 

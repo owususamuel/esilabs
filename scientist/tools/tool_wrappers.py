@@ -47,7 +47,7 @@ class ReadFileContents(Tool):
 
 class ListDirectoryFiles(Tool):
     name = "list_directory_files"
-    description = """Lists files in a directory, useful for discovering entry points and structure.
+    description = """Lists files and directories at the specified path.
     
     Args:
         directory_path: Path to the directory to list
@@ -55,6 +55,9 @@ class ListDirectoryFiles(Tool):
         
     Returns:
         JSON string with list of files found
+    
+    Note: This tool excludes common directories like .git, node_modules, .venv, __pycache__, etc.
+    It will stop scanning if more than 10,000 files are found to prevent excessive resource usage.
     """
     
     inputs = {
@@ -70,39 +73,89 @@ class ListDirectoryFiles(Tool):
     }
     output_type = "string"
     
+    # Common directories to exclude from scanning
+    EXCLUDED_DIRS = {
+        '.git', '.venv', 'venv', 'node_modules', '__pycache__', 
+        '.pytest_cache', '.mypy_cache', '.tox', '.eggs', 
+        'dist', 'build', '.next', '.nuxt', 'target',
+        '.idea', '.vscode', '.DS_Store', 'venv_cache'
+    }
+    
+    MAX_FILES_TO_SCAN = 10000  # Safety limit
+    
+    def _should_skip_directory(self, dir_path: Path) -> bool:
+        """Check if a directory should be skipped."""
+        return any(excluded in dir_path.parts for excluded in self.EXCLUDED_DIRS)
+    
     def forward(self, directory_path: str, pattern: Optional[str] = None) -> str:
-        """List files in a directory."""
+        """List files in a directory with safety limits and exclusions."""
         try:
-            path = Path(directory_path)
+            path = Path(directory_path).resolve()
             if not path.exists():
                 return json.dumps({"error": f"Directory not found: {directory_path}"})
             
-            if pattern:
-                files = [str(f.relative_to(path)) for f in path.rglob(pattern)]
-            else:
-                files = [str(f.relative_to(path)) for f in path.rglob("*") if f.is_file()]
+            if not path.is_dir():
+                return json.dumps({"error": f"Not a directory: {directory_path}"})
             
-            return json.dumps({"files": files[:50]})  # Limit to 50 files
+            files = []
+            directories = []
+            files_scanned = 0
+            
+            # Walk the directory tree manually to have better control
+            for item in path.rglob(pattern if pattern else "*"):
+                # Safety check: stop if we've scanned too many files
+                files_scanned += 1
+                if files_scanned > self.MAX_FILES_TO_SCAN:
+                    return json.dumps({
+                        "error": f"Directory scan limit exceeded ({self.MAX_FILES_TO_SCAN} files). "
+                                f"Please specify a more specific directory or pattern.",
+                        "files": files[:50],
+                        "directories": directories[:50],
+                        "total_files": len(files),
+                        "total_directories": len(directories),
+                        "scan_incomplete": True
+                    })
+                
+                # Skip excluded directories
+                if self._should_skip_directory(item):
+                    continue
+                
+                try:
+                    rel_path = str(item.relative_to(path))
+                    if item.is_dir():
+                        directories.append(rel_path)
+                    elif item.is_file():
+                        files.append(rel_path)
+                except (ValueError, OSError):
+                    # Skip items that can't be processed
+                    continue
+            
+            unique_dirs = list(dict.fromkeys(directories))
+            unique_files = list(dict.fromkeys(files))
+            
+            return json.dumps({
+                "files": unique_files[:100],  # Show more files in the preview
+                "directories": unique_dirs[:100],
+                "total_files": len(unique_files),
+                "total_directories": len(unique_dirs)
+            })
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": f"Error listing directory: {str(e)}"})
 
 
 class RunCommandInRepo(Tool):
     name = "run_command_in_repo"
     description = """Executes a command in the repository directory.
-    Use this to run scripts with --help, install dependencies, or execute experiments.
-    
-    ⚠️  CRITICAL: For dependency installation, ALWAYS use 'uv pip install', NEVER plain 'pip install'
-    ✅ CORRECT: uv pip install -r requirements.txt
-    ❌ WRONG:   pip install -r requirements.txt
+    Use this to run scripts, install dependencies, or execute experiments.
     
     Args:
-        command: The command to run (e.g., "python script.py --help", "uv pip install -r requirements.txt")
+        command: The command to run (e.g., "python script.py --help", "uv pip install torch")
         working_directory: Directory to run the command in
         timeout: Optional timeout in seconds (default: 60)
+        capture_output: Whether to capture stdout/stderr (default: True)
         
     Returns:
-        JSON string with stdout, stderr, exit_code, and any error suggestions
+        JSON string with stdout, stderr, exit_code, and success flag
     """
     
     inputs = {
@@ -144,77 +197,16 @@ class RunCommandInRepo(Tool):
     ) -> str:
         """Execute a command and return results."""
         try:
-            # Block unsafe attempts to inject or fabricate secrets
-            secret_indicators = ("OPENAI", "ANTHROPIC", "AZURE", "HF_", "API_KEY", "TOKEN", "SECRET", "CREDENTIAL")
-            lower_cmd = command.lower()
-            # Heuristics: writing to .env, exporting sensitive vars, or echoing keys
-            if (
-                ".env" in command
-                and any(ind.lower() in lower_cmd for ind in secret_indicators)
-            ) or (
-                ("export " in command or "set " in lower_cmd)
-                and any(ind.lower() in lower_cmd for ind in secret_indicators)
-            ):
-                return json.dumps({
-                    "success": False,
-                    "stdout": "",
-                    "stderr": (
-                        "Blocked command that attempts to set or write secrets. "
-                        "Secrets must be provided by the user via environment variables. "
-                        "Please provide the required keys (e.g., OPENAI_API_KEY, AZURE_API_KEY, ANTHROPIC_API_KEY, HF_TOKEN) "
-                        "when prompted."
-                    ),
-                    "exit_code": -1,
-                    "validation_error": True,
-                    "error_type": "secrets_policy_violation"
-                })
-            
-            # Detect repository virtual environment
+            # Detect repository virtual environment and set up PATH
             venv_dir = Path(working_directory) / ".venv"
             venv_bin_path = None
-            venv_python = None
+            
             if venv_dir.exists():
                 for candidate in ("bin", "Scripts"):
                     bin_path = venv_dir / candidate
                     if bin_path.exists():
                         venv_bin_path = bin_path.resolve()
-                        for python_name in ("python", "python3", "python.exe"):
-                            python_path = bin_path / python_name
-                            if python_path.exists():
-                                venv_python = python_path.resolve()
-                                break
-                        if venv_python:
-                            break
-            
-            # Validate pip commands - enforce 'uv pip install' usage
-            if 'pip install' in command and not command.strip().startswith('uv pip'):
-                warning_msg = (
-                    "⚠️  WARNING: You are using 'pip install' without 'uv'. "
-                    "This will likely fail. Use 'uv pip install' instead.\n"
-                    f"Command attempted: {command}\n"
-                    f"Recommended: {command.replace('pip install', 'uv pip install')}"
-                )
-                return json.dumps({
-                    "success": False,
-                    "stdout": "",
-                    "stderr": warning_msg,
-                    "exit_code": -1,
-                    "validation_error": True
-                })
-            
-            # If using 'uv pip install' within a repo that has a .venv,
-            # ensure packages are installed into that exact interpreter.
-            # This avoids installing into a different environment than the one used to run the script.
-            if (
-                command.strip().startswith('uv pip install')
-                and '--python' not in command
-                and venv_python
-            ):
-                parts = command.split()
-                if len(parts) >= 3 and parts[0] == 'uv' and parts[1] == 'pip' and parts[2] == 'install':
-                    prefix = parts[:3]
-                    rest = parts[3:]
-                    command = ' '.join(prefix + ['--python', str(venv_python)] + rest)
+                        break
             
             env = os.environ.copy()
             if venv_bin_path:
@@ -245,9 +237,7 @@ class RunCommandInRepo(Tool):
                     process.kill()
                     return json.dumps({
                         "success": False,
-                        "error": f"Command timed out after {timeout} seconds",
-                        "error_type": "timeout",
-                        "suggestion": "Command may be waiting for input or is blocking. Try with non-interactive flags or different arguments."
+                        "error": f"Command timed out after {timeout} seconds"
                     })
             
             result = subprocess.run(
@@ -260,118 +250,29 @@ class RunCommandInRepo(Tool):
                 timeout=timeout
             )
             
-            # Enhanced error detection for pip/uv issues
-            # Capture larger output for metrics extraction (experiments often print results at the end)
-            response = {
+            # Return results - let the agent interpret errors and decide what to do
+            return json.dumps({
                 "success": result.returncode == 0,
-                "stdout": result.stdout[:50000],  # Increased from 2000 to 50000 for metrics
-                "stderr": result.stderr[:50000],  # Increased from 2000 to 50000 for metrics
+                "stdout": result.stdout[:50000],
+                "stderr": result.stderr[:50000],
                 "exit_code": result.returncode
-            }
-            
-            # Detect common package manager errors
-            stderr_lower = result.stderr.lower()
-            if 'pip: command not found' in stderr_lower or 'pip: not found' in stderr_lower:
-                response["error_type"] = "pip_not_found"
-                response["suggestion"] = "Use 'uv pip install' instead of 'pip install'"
-            elif 'uv: command not found' in stderr_lower or 'uv: not found' in stderr_lower:
-                response["error_type"] = "uv_not_found"
-                response["suggestion"] = "uv package manager is not available in this environment"
-            
-            # Detect missing API keys / environment variables in stderr
-            missing_keys = self._detect_missing_api_keys(result.stderr)
-            if missing_keys and self.interactive_handler:
-                response["error_type"] = "missing_api_keys"
-                response["missing_keys"] = missing_keys
-                response["suggestion"] = f"Missing API keys detected: {', '.join(missing_keys)}. Prompting user for input..."
-                
-                # Prompt user for missing keys
-                prompted_keys = self._prompt_for_keys(missing_keys)
-                if prompted_keys:
-                    response["keys_provided"] = list(prompted_keys.keys())
-                    response["suggestion"] += f" User provided {len(prompted_keys)} key(s). Retry the command."
-                else:
-                    response["suggestion"] += " User skipped providing keys. Command will likely fail again."
-            
-            return json.dumps(response)
+            })
             
         except subprocess.TimeoutExpired:
             return json.dumps({
                 "success": False,
-                "error": f"Command timed out after {timeout} seconds",
-                "error_type": "timeout",
-                "suggestion": "Command may be waiting for input or is blocking. Try with non-interactive flags or different arguments."
+                "error": f"Command timed out after {timeout} seconds"
             })
         except Exception as e:
             return json.dumps({
                 "success": False,
-                "error": str(e),
-                "error_type": "execution_error"
+                "error": str(e)
             })
-    
-    def _detect_missing_api_keys(self, stderr: str) -> list:
-        """
-        Detect missing API keys from error messages.
-        
-        Args:
-            stderr: Standard error output
-            
-        Returns:
-            List of missing key names
-        """
-        import re
-        
-        missing_keys = []
-        
-        # Common patterns for missing API keys
-        patterns = [
-            r"KeyError:\s*['\"]([A-Z_][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|CREDENTIALS)[A-Z0-9_]*)['\"]",
-            r"Missing\s+(?:environment\s+)?variable:\s*([A-Z_][A-Z0-9_]*)",
-            r"([A-Z_][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET)[A-Z0-9_]*)\s+(?:is\s+)?not\s+(?:set|found|defined)",
-            r"Environment\s+variable\s+['\"]?([A-Z_][A-Z0-9_]*)['\"]?\s+(?:is\s+)?not\s+set",
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, stderr, re.IGNORECASE | re.MULTILINE)
-            for match in matches:
-                key = match.upper() if isinstance(match, str) else match[0].upper()
-                if key and key not in missing_keys:
-                    missing_keys.append(key)
-        
-        return missing_keys
-    
-    def _prompt_for_keys(self, missing_keys: list) -> dict:
-        """
-        Prompt user for missing API keys.
-        
-        Args:
-            missing_keys: List of missing key names
-            
-        Returns:
-            Dictionary of key -> value pairs
-        """
-        if not self.interactive_handler:
-            return {}
-        
-        import os
-        
-        # Format keys for prompt
-        key_info = [{'key': key, 'description': f'Required by experiment'} for key in missing_keys]
-        
-        # Prompt user
-        provided = self.interactive_handler.prompt_for_api_keys(key_info)
-        
-        # Set in environment
-        for key, value in provided.items():
-            os.environ[key] = value
-        
-        return provided
 
 
 class CreateFileOrDirectory(Tool):
     name = "create_file_or_directory"
     description = """Creates a file or directory in the repository.
-    Use this when the code needs input files or output directories.
     
     Args:
         path: Path to create (if ends with /, creates directory, otherwise creates empty file)
@@ -437,72 +338,13 @@ class CreateFileOrDirectory(Tool):
             return f"Error: {str(e)}"
 
 
-class SearchGitHub(Tool):
-    name = "search_github"
-    description = """Searches GitHub for repositories matching a query.
-    Use this to find repositories related to a research paper.
-    
-    Args:
-        query: Search query (paper title, author name, keywords)
-        max_results: Maximum number of results to return (default: 5)
-        
-    Returns:
-        JSON string with repository information (name, url, stars, description)
-    """
-    
-    inputs = {
-        "query": {
-            "type": "string",
-            "description": "Search query"
-        },
-        "max_results": {
-            "type": "integer",
-            "description": "Max results",
-            "nullable": True
-        }
-    }
-    output_type = "string"
-    
-    def __init__(self, github_tool):
-        """Initialize with actual GitHub search tool."""
-        super().__init__()
-        self.github_tool = github_tool
-    
-    def forward(self, query: str, max_results: Optional[int] = 5) -> str:
-        """Search GitHub."""
-        try:
-            # Use find_repository method which returns Repository objects
-            results = self.github_tool.find_repository(
-                paper_title=query,
-                authors=None,
-                max_results=max_results
-            )
-            
-            repos = []
-            for repo in results[:max_results]:
-                repos.append({
-                    "name": repo.name,
-                    "url": repo.url,
-                    "stars": repo.stars,
-                    "description": (repo.description or "")[:200],
-                    "language": repo.language or "",
-                    "last_updated": repo.last_updated or ""
-                })
-            
-            return json.dumps({"repositories": repos})
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-
 class ExtractMetrics(Tool):
     name = "extract_metrics"
-    description = """Intelligently extracts numerical metrics from experiment output using LLM.
-    Can handle any format: JSON files, text logs, tables, mixed formats.
-    
-    Use this to extract results from experiment output files or stdout.
+    description = """Extracts numerical metrics from text using LLM.
+    Can handle multiple formats: JSON, logs, tables, etc.
     
     Args:
-        text: Text containing metrics (from files, logs, or command output)
+        text: Text containing metrics
         
     Returns:
         JSON string with extracted metrics like {"metric_name": value}
@@ -536,6 +378,339 @@ class ExtractMetrics(Tool):
             return json.dumps({"metrics": metrics})
         except Exception as e:
             return json.dumps({"error": str(e), "metrics": {}})
+
+
+class RequestCredentials(Tool):
+    name = "request_credentials"
+    description = """Prompts the user for API keys or credentials.
+    
+    Args:
+        keys: Comma-separated list of required API key names
+        reason: Brief explanation of why these keys are needed
+        
+    Returns:
+        JSON string indicating which keys were provided by the user
+    """
+    
+    inputs = {
+        "keys": {
+            "type": "string",
+            "description": "Comma-separated list of required API key names"
+        },
+        "reason": {
+            "type": "string",
+            "description": "Brief explanation of why these keys are needed"
+        }
+    }
+    output_type = "string"
+    
+    def __init__(self):
+        super().__init__()
+        self.interactive_handler = None
+    
+    def set_interactive_handler(self, handler):
+        """Set the interactive handler for prompting user input."""
+        self.interactive_handler = handler
+    
+    def forward(self, keys: str, reason: str) -> str:
+        """Request credentials from the user."""
+        try:
+            import os
+            
+            # Parse key names
+            key_names = [k.strip() for k in keys.split(',') if k.strip()]
+            
+            if not key_names:
+                return json.dumps({
+                    "success": False,
+                    "error": "No key names provided"
+                })
+            
+            # Check which keys are already set
+            already_set = [k for k in key_names if os.getenv(k)]
+            missing = [k for k in key_names if not os.getenv(k)]
+            
+            if not missing:
+                return json.dumps({
+                    "success": True,
+                    "message": f"All keys already set: {', '.join(already_set)}",
+                    "keys_provided": [],
+                    "keys_already_set": already_set
+                })
+            
+            # Prompt user for missing keys
+            if not self.interactive_handler:
+                return json.dumps({
+                    "success": False,
+                    "error": "No interactive handler available",
+                    "missing_keys": missing,
+                    "suggestion": "Set these environment variables manually and retry"
+                })
+            
+            print(f"\n⚠️  Missing required credentials: {', '.join(missing)}")
+            print(f"Reason: {reason}\n")
+            
+            # Format keys for prompt
+            key_info = [{'key': key, 'description': reason} for key in missing]
+            
+            # Prompt user
+            provided = self.interactive_handler.prompt_for_api_keys(key_info)
+            
+            # Set in environment
+            for key, value in provided.items():
+                os.environ[key] = value
+            
+            if provided:
+                return json.dumps({
+                    "success": True,
+                    "message": f"User provided {len(provided)} credential(s)",
+                    "keys_provided": list(provided.keys()),
+                    "keys_already_set": already_set
+                })
+            else:
+                return json.dumps({
+                    "success": False,
+                    "message": "User skipped providing credentials",
+                    "keys_provided": [],
+                    "keys_already_set": already_set,
+                    "warning": "Experiment will likely fail without these credentials"
+                })
+        except Exception as e:
+            return json.dumps({
+                "success": False,
+                "error": str(e)
+            })
+
+
+class AnalyzePlotSemantics(Tool):
+    name = "analyze_plot_semantics"
+    description = """Uses vision-language model to semantically understand and compare plots/figures.
+    This provides deeper analysis than pixel comparison - it interprets what the plot shows.
+    
+    Args:
+        image_path: Path to the plot/figure image file
+        question: What to analyze (e.g., "What trends does this plot show?", "What metrics are displayed?")
+        reference_image_path: Optional reference image to compare against
+        
+    Returns:
+        Semantic description and analysis of the plot
+    """
+    
+    inputs = {
+        "image_path": {
+            "type": "string",
+            "description": "Path to the plot/figure image"
+        },
+        "question": {
+            "type": "string",
+            "description": "What to analyze about the plot"
+        },
+        "reference_image_path": {
+            "type": "string",
+            "description": "Optional reference image path for comparison",
+            "nullable": True
+        }
+    }
+    output_type = "string"
+    
+    def __init__(self, vision_model_client=None):
+        """Initialize with optional vision model client."""
+        super().__init__()
+        self.vision_client = vision_model_client
+    
+    def forward(self, image_path: str, question: str, reference_image_path: Optional[str] = None) -> str:
+        """Analyze plot using vision-language model."""
+        try:
+            import base64
+            from pathlib import Path
+            
+            # Load image
+            img_path = Path(image_path)
+            if not img_path.exists():
+                return json.dumps({"error": f"Image not found: {image_path}"})
+            
+            # Encode image as base64
+            with open(img_path, 'rb') as f:
+                image_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            # Prepare reference image if provided
+            reference_data = None
+            if reference_image_path:
+                ref_path = Path(reference_image_path)
+                if ref_path.exists():
+                    with open(ref_path, 'rb') as f:
+                        reference_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            # Use vision model if available
+            if self.vision_client:
+                messages = []
+                
+                if reference_data:
+                    # Comparison mode
+                    prompt = f"""{question}
+                    
+                    Compare these two plots/figures:
+                    - First image: Reference/original from paper
+                    - Second image: Reproduced from running code
+                    
+                    Analyze:
+                    1. What data/trends does each show?
+                    2. Are the trends/patterns similar?
+                    3. Are the scales/axes comparable?
+                    4. Overall: Do these plots show reproducible results?
+                    """
+                    
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{reference_data}"}},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}}
+                            ]
+                        }
+                    ]
+                else:
+                    # Single image analysis
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": question},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}}
+                            ]
+                        }
+                    ]
+                
+                # Call vision model
+                response = self.vision_client.chat.completions.create(
+                    model="gpt-4o",  # or another vision-capable model
+                    messages=messages,
+                    max_tokens=1000
+                )
+                
+                analysis = response.choices[0].message.content
+                
+                return json.dumps({
+                    "success": True,
+                    "analysis": analysis,
+                    "image_analyzed": str(img_path),
+                    "reference_used": str(reference_image_path) if reference_image_path else None
+                })
+            else:
+                return json.dumps({
+                    "error": "Vision model not available",
+                    "suggestion": "Configure OpenAI API key with vision-capable model"
+                })
+                
+        except Exception as e:
+            return json.dumps({"error": f"Error analyzing plot: {str(e)}"})
+
+
+class ExtractTableMetrics(Tool):
+    name = "extract_table_metrics"
+    description = """Extracts numerical metrics from tables in text or images.
+    Can parse markdown tables, CSV-like text, or use OCR on table images.
+    
+    Args:
+        source: Table source (text with table, or path to image)
+        source_type: Either 'text' or 'image'
+        
+    Returns:
+        JSON with extracted metrics from the table
+    """
+    
+    inputs = {
+        "source": {
+            "type": "string",
+            "description": "Table content as text or path to table image"
+        },
+        "source_type": {
+            "type": "string",
+            "description": "Either 'text' or 'image'"
+        }
+    }
+    output_type = "string"
+    
+    def __init__(self, llm_client=None):
+        super().__init__()
+        self.llm_client = llm_client
+    
+    def forward(self, source: str, source_type: str = "text") -> str:
+        """Extract metrics from table."""
+        try:
+            if source_type == "image":
+                # Use OCR or vision model for table extraction
+                from pathlib import Path
+                import base64
+                
+                img_path = Path(source)
+                if not img_path.exists():
+                    return json.dumps({"error": f"Image not found: {source}"})
+                
+                if self.llm_client and hasattr(self.llm_client, 'chat'):
+                    # Use vision model to extract table data
+                    with open(img_path, 'rb') as f:
+                        image_data = base64.b64encode(f.read()).decode('utf-8')
+                    
+                    messages = [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Extract all numerical metrics from this table. Return as JSON with metric names as keys and values as numbers."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}}
+                        ]
+                    }]
+                    
+                    response = self.llm_client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=messages,
+                        max_tokens=1000
+                    )
+                    
+                    content = response.choices[0].message.content
+                    # Try to extract JSON from response
+                    import re
+                    json_match = re.search(r'\{[^}]+\}', content)
+                    if json_match:
+                        metrics = json.loads(json_match.group(0))
+                        return json.dumps({"success": True, "metrics": metrics})
+                    
+                return json.dumps({"error": "Could not extract table from image"})
+            
+            else:
+                # Parse text table
+                metrics = {}
+                lines = source.split('\n')
+                
+                for line in lines:
+                    # Look for patterns like "Metric: Value" or "| Metric | Value |"
+                    import re
+                    
+                    # Markdown table row
+                    if '|' in line:
+                        parts = [p.strip() for p in line.split('|') if p.strip()]
+                        if len(parts) >= 2:
+                            key = parts[0]
+                            for val in parts[1:]:
+                                try:
+                                    num = float(val.replace('%', '').strip())
+                                    metrics[f"{key}_{parts.index(val)}"] = num
+                                except ValueError:
+                                    continue
+                    
+                    # Key: Value format
+                    elif ':' in line:
+                        key, val = line.split(':', 1)
+                        try:
+                            num = float(val.strip().replace('%', ''))
+                            metrics[key.strip()] = num
+                        except ValueError:
+                            continue
+                
+                return json.dumps({"success": True, "metrics": metrics})
+                
+        except Exception as e:
+            return json.dumps({"error": f"Error extracting table metrics: {str(e)}"})
 
 
 class ParsePDF(Tool):

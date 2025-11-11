@@ -11,7 +11,6 @@ import shutil
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 from dataclasses import dataclass
-import signal
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +29,6 @@ class ExecutionResult:
 
 
 class CodeExecutor:
-    # Commands that are forbidden for security
-    FORBIDDEN_COMMANDS = {
-        'rm', 'rmdir', 'sudo', 'chmod', 'chown',
-        'format', 'dd', 'mkfs', 'fdisk'
-    }
     
     def __init__(
         self,
@@ -64,22 +58,6 @@ class CodeExecutor:
         timeout: Optional[int] = None
     ) -> ExecutionResult:
 
-        # Validate command if sandbox mode is enabled
-        if self.sandbox_mode:
-            validation_error = self._validate_command(command)
-            if validation_error:
-                self.logger.error(f"Command validation failed: {validation_error}")
-                return ExecutionResult(
-                    exit_code=-1,
-                    stdout="",
-                    stderr=validation_error,
-                    duration_seconds=0,
-                    success=False,
-                    timed_out=False,
-                    error_message=validation_error
-                )
-        
-        # Use provided timeout or max timeout
         timeout = timeout or self.max_timeout
         
         # Prepare environment
@@ -206,26 +184,6 @@ class CodeExecutor:
         self.logger.info("All setup commands completed successfully")
         return True, combined_output
     
-    def _validate_command(self, command: str) -> Optional[str]:
-        
-        # Check for forbidden commands
-        cmd_lower = command.lower()
-        for forbidden in self.FORBIDDEN_COMMANDS:
-            if forbidden in cmd_lower:
-                return f"Forbidden command detected: {forbidden}"
-        
-        # Check for suspicious patterns
-        suspicious_patterns = ['||', '&&', '|', '`']
-        if any(pattern in command for pattern in suspicious_patterns):
-            # These are usually okay, but we could add more checks
-            pass
-        
-        # Check for path traversal attempts
-        if '..' in command:
-            self.logger.warning("Path traversal attempt detected in command")
-        
-        return None
-    
     def setup_environment(
         self,
         requirements_file: Optional[str] = None,
@@ -253,7 +211,7 @@ class CodeExecutor:
         branch: Optional[str] = None
     ) -> ExecutionResult:
  
-        command = f"git clone {('--branch ' + branch + ' ') if branch else ''}{repo_url} {target_directory}"
+        command = f"git clone {repo_url} {target_directory}"
         
         return self.execute_command(command, working_directory=".")
 

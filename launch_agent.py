@@ -15,4 +15,4 @@ print(f"Using PDF: {pdf_path}")
 
 from scientist.main import run_reproducibility_pipeline
 
-result = run_reproducibility_pipeline(pdf_path=pdf_path)
+result = run_reproducibility_pipeline(pdf_path=pdf_path, output_report=True)

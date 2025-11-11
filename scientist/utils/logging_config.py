@@ -21,7 +21,7 @@ def setup_logging(log_level: str = None) -> logging.Logger:
     """
     
     # Get log level from environment or parameter
-    log_level = log_level or os.getenv("LOG_LEVEL", "INFO")
+    log_level = log_level or os.getenv("LOG_LEVEL", "WARNING")
     log_dir = os.getenv("LOG_DIR", "./data/outputs/logs")
     
     # Create log directory if it doesn't exist

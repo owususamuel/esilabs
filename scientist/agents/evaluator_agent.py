@@ -1,5 +1,9 @@
 
 from typing import Dict, Any, Optional, List
+import io
+import math
+import base64
+from PIL import Image
 
 from scientist.agents.base_agent import BaseAgent
 from scientist.tools.result_comparator import ResultComparator
@@ -40,16 +44,155 @@ class EvaluatorAgent(BaseAgent):
         self.comparator = ResultComparator()
         
         # Import file reading tools for autonomous output file discovery
-        from scientist.tools.tool_wrappers import ReadFileContents, ListDirectoryFiles
+        from scientist.tools.tool_wrappers import ReadFileContents, ListDirectoryFiles, AnalyzePlotSemantics, ExtractTableMetrics
         
         # Register autonomous tools with LLM access for intelligent extraction
         self.register_tool("extract_metrics", None, ExtractMetrics(self.comparator, llm_client=self.model))
         self.register_tool("read_file_contents", None, ReadFileContents())
         self.register_tool("list_directory_files", None, ListDirectoryFiles())
+        self.register_tool("analyze_plot_semantics", None, AnalyzePlotSemantics(vision_model_client=self.model))
+        self.register_tool("extract_table_metrics", None, ExtractTableMetrics(llm_client=self.model))
         
         # Store references to tools for direct file reading
         self.read_file_tool = ReadFileContents()
         self.list_dir_tool = ListDirectoryFiles()
+    
+    def _load_image_from_base64(self, image_b64: str) -> Optional[Image.Image]:
+        
+        try:
+            raw = base64.b64decode(image_b64)
+            img = Image.open(io.BytesIO(raw))
+            return img.convert('RGB')
+        except Exception:
+            return None
+    
+    def _load_image_from_path(self, path: str) -> Optional[Image.Image]:
+        
+        try:
+            img = Image.open(path)
+            return img.convert('RGB')
+        except Exception:
+            return None
+    
+    def _compute_ahash_similarity(self, img1: Image.Image, img2: Image.Image) -> float:
+        
+        def ahash(img: Image.Image) -> List[int]:
+            g = img.resize((8, 8), Image.Resampling.LANCZOS).convert('L')
+            pixels = list(g.getdata())
+            avg = sum(pixels) / len(pixels) if pixels else 0
+            return [1 if p >= avg else 0 for p in pixels]
+        
+        h1 = ahash(img1)
+        h2 = ahash(img2)
+        same = sum(1 for a, b in zip(h1, h2) if a == b)
+        return same / 64.0
+    
+    def _compute_histogram_similarity(self, img1: Image.Image, img2: Image.Image) -> float:
+        
+        h1 = img1.histogram()
+        h2 = img2.histogram()
+        if not h1 or not h2 or len(h1) != len(h2):
+            return 0.0
+        dot = 0.0
+        n1 = 0.0
+        n2 = 0.0
+        for a, b in zip(h1, h2):
+            dot += float(a) * float(b)
+            n1 += float(a) * float(a)
+            n2 += float(b) * float(b)
+        denom = math.sqrt(n1) * math.sqrt(n2)
+        return (dot / denom) if denom > 0 else 0.0
+    
+    def _compute_psnr(self, img1: Image.Image, img2: Image.Image) -> float:
+        
+        s1 = img1.resize((128, 128), Image.Resampling.LANCZOS).convert('L')
+        s2 = img2.resize((128, 128), Image.Resampling.LANCZOS).convert('L')
+        p1 = list(s1.getdata())
+        p2 = list(s2.getdata())
+        if not p1 or not p2 or len(p1) != len(p2):
+            return 0.0
+        mse = 0.0
+        for a, b in zip(p1, p2):
+            d = float(a) - float(b)
+            mse += d * d
+        mse /= len(p1)
+        if mse == 0:
+            return 99.0
+        return 20.0 * math.log10(255.0 / math.sqrt(mse))
+    
+    def _compare_images(
+        self,
+        paper_figures_b64: List[str],
+        repo_image_paths: List[str]
+    ) -> Dict[str, Any]:
+        
+        paper_images: List[Image.Image] = []
+        for b64s in paper_figures_b64:
+            img = self._load_image_from_base64(b64s)
+            if img:
+                paper_images.append(img)
+        
+        repo_images: List[tuple[str, Image.Image]] = []
+        for p in repo_image_paths:
+            img = self._load_image_from_path(p)
+            if img:
+                repo_images.append((p, img))
+        
+        if not paper_images or not repo_images:
+            return {'comparisons': [], 'visual_score': 0.0}
+        
+        # Precompute pairwise similarities
+        pairs: List[Dict[str, Any]] = []
+        for i, pimg in enumerate(paper_images):
+            for rpath, rimg in repo_images:
+                try:
+                    ah = self._compute_ahash_similarity(pimg, rimg)
+                    hist = self._compute_histogram_similarity(pimg, rimg)
+                    psnr = self._compute_psnr(pimg, rimg)
+                    # Combined similarity emphasizes structure and distribution
+                    combined = 0.6 * ah + 0.4 * max(0.0, min(1.0, hist))
+                    pairs.append({
+                        'paper_index': i,
+                        'repo_path': rpath,
+                        'ahash': ah,
+                        'histogram_sim': hist,
+                        'psnr': psnr,
+                        'combined': combined
+                    })
+                except Exception:
+                    continue
+        
+        # Greedy one-to-one matching
+        pairs.sort(key=lambda x: (x['combined'], x['psnr']), reverse=True)
+        used_papers = set()
+        used_repo = set()
+        matches: List[Dict[str, Any]] = []
+        for item in pairs:
+            pi = item['paper_index']
+            rp = item['repo_path']
+            if pi in used_papers or rp in used_repo:
+                continue
+            # Heuristic threshold: good visual match if combined >= 0.85 or PSNR >= 28
+            is_match = (item['combined'] >= 0.85) or (item['psnr'] >= 28.0)
+            matches.append({
+                'paper_figure_index': pi,
+                'repo_image_path': rp,
+                'ahash_similarity': item['ahash'],
+                'histogram_similarity': item['histogram_sim'],
+                'psnr': item['psnr'],
+                'combined_similarity': item['combined'],
+                'match': bool(is_match)
+            })
+            used_papers.add(pi)
+            used_repo.add(rp)
+        
+        if not matches:
+            return {'comparisons': [], 'visual_score': 0.0}
+        
+        # Visual score: average combined similarity over matched items that passed threshold
+        matched = [m for m in matches if m['match']]
+        visual_score = (sum(m['combined_similarity'] for m in matched) / len(matched)) if matched else 0.0
+        return {'comparisons': matches, 'visual_score': visual_score}
     
     def _detect_plot_files(self, output_dir: str) -> List[Dict[str, Any]]:
 
@@ -271,22 +414,69 @@ class EvaluatorAgent(BaseAgent):
             # Build plot information summary if plots were detected
             plot_summary = "No plot files detected."
             if has_plots and plot_info:
-                plot_summary = f"✅ Detected {len(plot_info)} plot/figure files:\n"
+                plot_summary = f"Detected {len(plot_info)} plot/figure files:\n"
                 for plot in plot_info[:10]:  # Show first 10 plots
                     plot_summary += f"  - {plot['filename']} ({plot['size_kb']:.1f} KB)\n"
                 if len(plot_info) > 10:
-                    plot_summary += f"  ... and {len(plot_info) - 10} more plots\n"
-                plot_summary += "\n⚠️ Note: Many scientific papers present results as graphs/plots. "
-                plot_summary += "If numerical metrics are not available, evaluate based on the presence "
-                plot_summary += "and organization of plot files as visual metrics."
+                    plot_summary += f"  ... and {len(plot_info) - 10} more plots"
+            
+            # Visual comparison (paper figures vs produced plots)
+            # Build structured mapping: Figure 1 -> reproduced_plot_1.png
+            image_comparisons: List[Dict[str, Any]] = []
+            visual_score: float = 0.0
+            figure_mapping: List[Dict[str, Any]] = []
+            
+            try:
+                paper_figures_input = task.get('paper_figures') or []
+                paper_b64_list: List[str] = []
+                paper_fig_metadata: List[Dict[str, Any]] = []
+                
+                for fig in paper_figures_input:
+                    if isinstance(fig, dict):
+                        b64v = fig.get('image_base64') or fig.get('b64') or fig.get('image')
+                        if isinstance(b64v, str):
+                            paper_b64_list.append(b64v)
+                            # Store metadata for structured mapping
+                            paper_fig_metadata.append({
+                                'figure_number': fig.get('figure_number', len(paper_b64_list)),
+                                'caption': fig.get('caption', ''),
+                                'page_number': fig.get('page_number', 0)
+                            })
+                
+                repo_paths: List[str] = [p['full_path'] for p in (plot_info or []) if isinstance(p, dict) and p.get('full_path')]
+                
+                if paper_b64_list and repo_paths:
+                    vis = self._compare_images(paper_b64_list, repo_paths)
+                    image_comparisons = vis.get('comparisons', [])
+                    visual_score = float(vis.get('visual_score', 0.0))
+                    
+                    # Create structured mapping
+                    for comp in image_comparisons:
+                        paper_idx = comp.get('paper_figure_index', 0)
+                        if paper_idx < len(paper_fig_metadata):
+                            metadata = paper_fig_metadata[paper_idx]
+                            figure_mapping.append({
+                                'paper_figure': f"Figure {metadata['figure_number']}",
+                                'paper_caption': metadata['caption'],
+                                'paper_page': metadata['page_number'],
+                                'reproduced_file': comp.get('repo_image_path', ''),
+                                'similarity_score': comp.get('combined_similarity', 0.0),
+                                'match': comp.get('match', False)
+                            })
+            except Exception:
+                # Non-fatal
+                pass
             
             # Fill in template variables
-            agent_task = task_prompt_template.format(
-                paper_str=paper_str[:2000],
-                repro_str=repro_str[:2000],
-                output_dir=output_dir,
-                code_notes=code_notes,
-                doc_notes=doc_notes
+            agent_task = BaseAgent._render_template(
+                task_prompt_template,
+                {
+                    "paper_str": paper_str[:2000],
+                    "repro_str": repro_str[:2000],
+                    "output_dir": str(output_dir),
+                    "code_notes": code_notes,
+                    "doc_notes": doc_notes,
+                }
             )
             
             # Append plot information to the task
@@ -353,11 +543,14 @@ class EvaluatorAgent(BaseAgent):
                 'has_plot_metrics': has_plots,
                 'plot_files': plot_info if has_plots else [],
                 'plot_count': len(plot_info) if has_plots else 0,
+                'image_comparisons': image_comparisons,
+                'visual_score': visual_score,
+                'figure_mapping': figure_mapping,  # Structured mapping: Figure X -> reproduced file
                 'analysis': analysis_text,
                 'likely_causes': likely_causes,
                 'recommendations': recommendations,
                 'execution_type': 'autonomous',
-                'note': 'Deterministic scoring computed; LLM provided narrative analysis'
+                'note': 'Deterministic scoring + semantic visual analysis via vision model'
             }
             
             self.log_execution("autonomous_evaluation", result)

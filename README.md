@@ -40,16 +40,17 @@ This system uses **LLM intelligence** for decision-making, not procedural code:
    - **LLM**: Intelligently extract datasets, hyperparameters, methodology
 
 2. **Repo Finder Agent**  
-   - Tools: Query GitHub API, get repo metadata
-   - **LLM**: Analyze and select the most likely official repository
+   - Tools: Build search queries and URLs for repository discovery
+   - **LLM**: Generate search queries based on paper metadata
 
 3. **Experiment Runner Agent**
    - Tools: Read files, run commands
    - **LLM**: Understand repository, determine how to run code, construct command with all required arguments
 
 4. **Evaluator Agent**
-   - Tools: Calculate metric differences
-   - **LLM**: Analyze WHY results differ, assess quality, provide recommendations
+   - Tools: Calculate metric differences, vision model for semantic plot comparison
+   - **LLM**: Analyze WHY results differ, semantically compare figures, assess quality, provide recommendations
+   - **NEW**: Uses vision-language models (GPT-4V, Claude 3) to understand plots semantically, not just pixel-wise
 
 ### Installation
 
@@ -82,6 +83,17 @@ python launch_agent.py
 # or with uv
 uv run launch_agent.py
 ```
+
+### LLM Configuration (smolagents style)
+
+This project now mirrors the [official smolagents quick demo](https://github.com/huggingface/smolagents#quick-demo):
+
+- Pick any model/provider via `.env` — `MODEL_PROVIDER` accepts `openai`, `azure`, `anthropic`, or `ollama`.  
+- Use `MODEL_NAME` to point at the exact model (for example `gpt-4o`, `claude-3-sonnet`, or a local `llama3.1:8b`).  
+- Optional: set `LLM_CODE_RETRIES` to tell the agent how many times it should gently remind smaller models to answer with Python-only tool calls (default `3`).  
+- Credentials stay outside the repo: supply the right API key for the provider you choose (OpenAI, Anthropic, Azure, etc.) or keep everything local with Ollama/transformers.
+
+Because smolagents is model-agnostic, you can swap providers without touching the codebase — update the environment variables and rerun `launch_agent.py`.
 
 ## 📚 Understanding the Code
 
@@ -120,9 +132,9 @@ Each agent works **autonomously** using tools:
 - **Result**: Structured JSON with all paper information
 
 #### Repo Finder Agent
-- **Tools**: `search_github` (queries GitHub)
-- **Autonomous Behavior**: Agent searches GitHub with multiple queries, analyzes results, selects best match based on authors/stars/description
-- **Result**: Selected repository with confidence score and reasoning
+- **Tools**: Repository search query builder
+- **Autonomous Behavior**: Agent generates search queries based on paper title and authors, provides GitHub search URLs
+- **Result**: Search queries and URLs to help users find relevant repositories
 
 #### Interactive Mode 🎯
 
@@ -196,9 +208,33 @@ my_agent:
 2. Register in agent: `self.register_tool("tool_name", tool_function)`
 3. Use in agent: `result = self.tools["tool_name"](...)`
 
-## 📊 Output
+## 📊 Output & Visualizations
 
-The pipeline generates a comprehensive report in `data/outputs/`:
+The pipeline generates a comprehensive report package in `data/outputs/<run_id>/`:
+
+```
+data/outputs/20251107_120530/
+├── report_20251107_120530.json           # Raw data (machine-readable)
+├── report_20251107_120530.txt            # Human-readable report
+├── reproducibility_statement_20251107_120530.md  # Journal-ready statement
+└── visualizations/                        # 📊 Charts and graphs
+    ├── visualizations.html                # 🌐 Interactive dashboard
+    ├── overall_performance.png            # Summary scores
+    ├── baseline_vs_reproduced.png         # Metric comparison
+    ├── deviation_distribution.png         # Error distribution
+    └── detailed_comparison.csv            # Data for meta-analysis
+```
+
+### Interactive Dashboard
+
+Open `visualizations/visualizations.html` in your browser for an interactive view:
+
+- **Overall Score**: Visual reproducibility assessment
+- **Metric Comparison**: Side-by-side paper vs reproduced values
+- **Figure Mapping**: Paper figures matched to reproduced outputs
+- **Recommendations**: Actionable insights for improvement
+
+### JSON Report Structure
 
 ```json
 {
@@ -210,12 +246,59 @@ The pipeline generates a comprehensive report in `data/outputs/`:
     "experiment_results": [...],
     "evaluation": {
       "final_reproducibility_score": 0.85,
+      "metrics_matched": 8,
+      "total_metrics": 10,
+      "visual_score": 0.92,
+      "figure_mapping": [
+        {
+          "paper_figure": "Figure 1",
+          "reproduced_file": "output/accuracy_plot.png",
+          "semantic_analysis": "Both plots show accuracy improving from 0.6 to 0.9...",
+          "match": true
+        }
+      ],
       "issues_found": [...],
       "recommendations": [...]
     }
   }
 }
 ```
+
+### Export for Meta-Analysis
+
+The `detailed_comparison.csv` file contains all metrics in a structured format perfect for:
+- Meta-analysis across multiple papers
+- Statistical analysis in R/Python
+- Journal supplementary materials
+- Reproducibility databases
+
+## 🎨 Semantic Visual Comparison (NEW!)
+
+The system now uses **vision-language models** to deeply understand and compare plots:
+
+**Traditional Approach (Pixel-based):**
+- ❌ Fails when plots use different colors/styles
+- ❌ Can't handle different plotting libraries
+- ❌ Misses semantic equivalence
+
+**Our Enhanced Approach (Semantic):**
+- ✅ Understands what the plot **shows**, not just how it looks
+- ✅ Compares trends, patterns, and numerical values
+- ✅ Handles style variations gracefully
+- ✅ Provides human-like analysis: "Both plots show accuracy improving from 0.6 to 0.9 over epochs"
+
+**Example Comparison:**
+```
+Paper Figure 1: Blue line chart, accuracy curve
+Reproduced Plot: Red line chart, same data
+
+Pixel Similarity: 35% ❌ (different colors)
+Semantic Analysis: "Both show identical trends, values within 1%" ✅
+
+Result: Reproducible!
+```
+
+See [docs/semantic_visual_comparison.md](docs/semantic_visual_comparison.md) for full details.
 
 ## 🎓 Learning Objectives
 
@@ -244,4 +327,3 @@ The system uses a **hybrid approach** for managing Python environments:
 - ♻️  **Caching**: Identical `requirements.txt` → reuse cached venv (fast!)
 - 🚀 **Performance**: First run ~30s, cached runs ~0.1s
 - 💾 **Efficiency**: Disk space saved via symlinks
-
