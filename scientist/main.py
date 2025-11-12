@@ -13,7 +13,8 @@ from scientist.agents.evaluator_agent import EvaluatorAgent
 from scientist.utils.logging_config import setup_logging
 from scientist.utils.data_models import PipelineRun, PaperData
 from scientist.utils.interactive import InteractiveInputHandler
-from scientist.utils.report_generator import ReportGenerator
+from scientist.utils.enhanced_report import EnhancedReportGenerator
+from scientist.utils.material_organizer import MaterialOrganizer
 
 
 class ReproducibilityOrchestrator:
@@ -41,8 +42,11 @@ class ReproducibilityOrchestrator:
         # Initialize interactive handler for manual input fallback
         self.interactive_handler = InteractiveInputHandler()
         
-        # Initialize report generator
-        self.report_generator = ReportGenerator()
+        # Initialize enhanced report generator
+        self.report_generator = EnhancedReportGenerator()
+        
+        # Material organizer will be initialized per run
+        self.material_organizer = None
         
         self.current_run = None
     
@@ -59,6 +63,9 @@ class ReproducibilityOrchestrator:
         
         self.logger.info(f"Starting reproducibility pipeline (run_id: {run_id})")
         self.logger.info(f"Input PDF: {pdf_path}")
+        
+        # Initialize material organizer for this run
+        self.material_organizer = MaterialOrganizer(run_id)
         
         # Initialize pipeline run
         self.current_run = PipelineRun(
@@ -89,6 +96,18 @@ class ReproducibilityOrchestrator:
             paper_data = PaperData(**paper_data_dict)
             self.current_run.parsed_paper = paper_data
             self.current_run.paper_id = paper_data.title
+            
+            # 📁 SAVE PAPER MATERIALS TO ORGANIZED FOLDERS
+            self.logger.info("\n" + "="*50)
+            self.logger.info("💾 Saving Paper Materials to Organized Folders")
+            self.logger.info("="*50)
+            
+            paper_materials_saved = self.material_organizer.save_paper_materials(
+                figures=parsing_result.get('figures', []),
+                tables=parsing_result.get('tables', []),
+                metrics=paper_data_dict.get('extracted_metrics', {}),
+                paper_data=paper_data_dict
+            )
             
             # Stage 2: Find Repository
             self.logger.info("\n" + "="*50)
@@ -152,6 +171,25 @@ class ReproducibilityOrchestrator:
                 self.current_run.error_message = exp_error
                 return self._finalize_pipeline(failed=True)
             
+            # 📁 ORGANIZE REPRODUCED RESULTS TO FOLDERS
+            self.logger.info("\n" + "="*50)
+            self.logger.info("💾 Organizing Reproduced Results")
+            self.logger.info("="*50)
+            
+            reproduced_organized = self.material_organizer.organize_reproduced_results(
+                repo_path=exp_result.get('repo_path', repo_path or '')
+            )
+            
+            # 📁 CREATE COMPARISON MANIFEST
+            self.logger.info("\n" + "="*50)
+            self.logger.info("📋 Creating Comparison Manifest")
+            self.logger.info("="*50)
+            
+            comparison_manifest_path = self.material_organizer.create_comparison_manifest(
+                paper_materials_saved=paper_materials_saved,
+                reproduced_organized=reproduced_organized
+            )
+            
             # Stage 4: Evaluate Results
             self.logger.info("\n" + "="*50)
             self.logger.info("STAGE 4: Evaluating Reproducibility")
@@ -161,7 +199,11 @@ class ReproducibilityOrchestrator:
                 exp_result,
                 paper_data,
                 original_results_output,
-                parsing_result.get('figures')
+                parsing_result.get('figures'),
+                parsing_result.get('tables'),
+                paper_materials_dir=str(self.material_organizer.get_paper_materials_dir()),
+                reproduced_results_dir=str(self.material_organizer.get_reproduced_results_dir()),
+                comparison_manifest=comparison_manifest_path
             )
             self.current_run.evaluation_status = "completed" if eval_result['success'] else "failed"
             self.current_run.evaluation = eval_result
@@ -321,8 +363,14 @@ class ReproducibilityOrchestrator:
                     self.logger.info(f"  Duration: {result['duration_seconds']:.1f}s")
                 if result.get('exit_code') is not None:
                     self.logger.info(f"  Exit code: {result['exit_code']}")
-                if result.get('metrics'):
-                    self.logger.info(f"  Metrics extracted: {list(result['metrics'].keys())}")
+                
+                # Handle both dict and list formats for metrics
+                metrics = result.get('metrics') or result.get('metrics_extracted')
+                if metrics:
+                    if isinstance(metrics, dict):
+                        self.logger.info(f"  Metrics extracted: {list(metrics.keys())}")
+                    elif isinstance(metrics, list):
+                        self.logger.info(f"  Metrics extracted: {len(metrics)} data points")
             else:
                 fail_reason = result.get('error') or result.get('error_message') or result.get('stderr') or "Unknown failure"
                 self.logger.error(f"Experiment failed: {fail_reason}")
@@ -340,11 +388,22 @@ class ReproducibilityOrchestrator:
         experiment_result: Dict[str, Any],
         paper_data: PaperData,
         original_output: Optional[str],
-        paper_figures: Optional[List[Dict[str, Any]]]
+        paper_figures: Optional[List[Dict[str, Any]]],
+        paper_tables: Optional[List[Dict[str, Any]]] = None,
+        paper_materials_dir: Optional[str] = None,
+        reproduced_results_dir: Optional[str] = None,
+        comparison_manifest: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Execute evaluation stage."""
+        """Execute evaluation stage with organized materials for proper comparison."""
         
         try:
+            # Log the organized materials locations
+            if paper_materials_dir:
+                self.logger.info(f"📄 Paper materials available at: {paper_materials_dir}")
+            if reproduced_results_dir:
+                self.logger.info(f"🔬 Reproduced results available at: {reproduced_results_dir}")
+            if comparison_manifest:
+                self.logger.info(f"📋 Comparison manifest: {comparison_manifest}")
             # Build an LLM-friendly original results text from the parsed paper
             original_text = original_output or "\n\n".join([
                 f"Title: {paper_data.title}",
@@ -374,15 +433,25 @@ class ReproducibilityOrchestrator:
                 'reproduced_output': reproduced_text,
                 'original_output': original_text,
                 'output_directory': output_directory,
-                'paper_figures': paper_figures or []
+                'paper_figures': paper_figures or [],
+                'paper_tables': paper_tables or [],
+                'evaluation_metrics': paper_data.evaluation_metrics or [],
+                'paper_extracted_metrics': paper_data.extracted_metrics,  # SAVED metrics from paper parsing
+                # NEW: Organized material paths for proper comparison
+                'paper_materials_dir': paper_materials_dir,
+                'reproduced_results_dir': reproduced_results_dir,
+                'comparison_manifest': comparison_manifest
             }
             
             result = self.evaluator.execute(eval_config)
             
             if result['success']:
-                score = result['final_reproducibility_score']
+                score = result.get('final_reproducibility_score')
                 self.logger.info(f"Evaluation complete")
-                self.logger.info(f"  Reproducibility Score: {score:.2%}")
+                if isinstance(score, (int, float)):
+                    self.logger.info(f"  Reproducibility Score: {score:.2%}")
+                else:
+                    self.logger.info("  Reproducibility Score: N/A (no comparable metrics)")
                 self.logger.info(f"  Metrics matched: {result['metrics_matched']}/{result['total_metrics']}")
                 
                 if result.get('issues_found'):
@@ -458,22 +527,29 @@ class ReproducibilityOrchestrator:
         
         generated_files = {'json': output_path}
         
-        # Generate comprehensive report package if requested
-        if generate_full_report:
+        # Generate enhanced comprehensive reports (markdown + HTML + JSON)
+        if generate_full_report and self.material_organizer:
             try:
-                self.logger.info("Generating comprehensive report package...")
-                report_files = self.report_generator.generate_full_report(
-                    run_data=report_data,
-                    run_id=self.current_run.run_id,
-                    create_visualizations=generate_visualizations
+                self.logger.info("Generating comprehensive reproducibility reports...")
+                
+                paper_materials_dir = str(self.material_organizer.get_paper_materials_dir())
+                reproduced_results_dir = str(self.material_organizer.get_reproduced_results_dir())
+                comparison_dir = str(self.material_organizer.get_comparison_dir())
+                
+                report_files = self.report_generator.generate_comprehensive_report(
+                    paper_materials_dir=paper_materials_dir,
+                    reproduced_results_dir=reproduced_results_dir,
+                    output_dir=comparison_dir,
+                    run_id=self.current_run.run_id
                 )
                 generated_files.update(report_files)
                 
-                self.logger.info(f"✓ Report package complete: {len(generated_files)} files generated")
-                self.logger.info(f"  → View dashboard: {report_files.get('dashboard', 'N/A')}")
+                self.logger.info(f"✅ Enhanced reports generated: {len(report_files)} files")
+                for report_type, path in report_files.items():
+                    self.logger.info(f"  📄 {report_type.upper()}: {path}")
                 
             except Exception as e:
-                self.logger.error(f"Error generating full report: {e}", exc_info=True)
+                self.logger.error(f"Error generating enhanced report: {e}", exc_info=True)
                 self.logger.info("Continuing with basic JSON report...")
         
         return generated_files

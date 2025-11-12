@@ -48,9 +48,14 @@ This system uses **LLM intelligence** for decision-making, not procedural code:
    - **LLM**: Understand repository, determine how to run code, construct command with all required arguments
 
 4. **Evaluator Agent**
-   - Tools: Calculate metric differences, vision model for semantic plot comparison
+   - Tools: Calculate metric differences, vision model for semantic plot comparison, figure/table metric extraction
    - **LLM**: Analyze WHY results differ, semantically compare figures, assess quality, provide recommendations
-   - **NEW**: Uses vision-language models (GPT-4V, Claude 3) to understand plots semantically, not just pixel-wise
+   - **NEW**: Uses vision-language models (GPT-4V, Claude 3) to:
+     - Understand plots semantically, not just pixel-wise
+     - **Extract numerical metrics directly from paper figures AND tables** when text extraction fails
+     - Vision model parses figures/charts/plots (images)
+     - LLM intelligently parses standalone tables (text)
+     - Automatically handles all three: text tables, figure images, and tables-in-figures
 
 ### Installation
 
@@ -164,8 +169,15 @@ result = run_reproducibility_pipeline(
 - **Smart Caching**: Uses hybrid venv strategy for fast, isolated environments
 
 #### Evaluator Agent
-- **Tools**: `extract_metrics` (extracts numerical values)
+- **Tools**: `extract_metrics` (extracts numerical values), `extract_table_metrics` (from images), `analyze_plot_semantics` (vision model)
 - **Autonomous Behavior**: Agent compares original and reproduced results, analyzes significance of differences, identifies likely causes, provides recommendations
+- **Enhanced Metric Extraction** (Multi-Source):
+  - First attempts text-based extraction from paper results
+  - If no metrics found, **automatically extracts from paper figures AND tables**:
+    - **Figures** (vision model): Uses GPT-4V/Claude to parse charts, plots, and tables embedded in figures
+    - **Tables** (LLM parsing): Intelligently extracts from text-based tables (CSV, markdown, plain text)
+  - Prefixes extracted metrics with source context (e.g., "Figure_1_Recall@10", "Table_2_MRR")
+  - Handles all scenarios: standalone tables, standalone figures, and tables-in-figures
 - **Result**: Comprehensive reproducibility report with scores, analysis, and actionable insights
 
 ### 4. Tools
@@ -276,29 +288,12 @@ The `detailed_comparison.csv` file contains all metrics in a structured format p
 
 The system now uses **vision-language models** to deeply understand and compare plots:
 
-**Traditional Approach (Pixel-based):**
-- ❌ Fails when plots use different colors/styles
-- ❌ Can't handle different plotting libraries
-- ❌ Misses semantic equivalence
-
 **Our Enhanced Approach (Semantic):**
 - ✅ Understands what the plot **shows**, not just how it looks
 - ✅ Compares trends, patterns, and numerical values
 - ✅ Handles style variations gracefully
 - ✅ Provides human-like analysis: "Both plots show accuracy improving from 0.6 to 0.9 over epochs"
 
-**Example Comparison:**
-```
-Paper Figure 1: Blue line chart, accuracy curve
-Reproduced Plot: Red line chart, same data
-
-Pixel Similarity: 35% ❌ (different colors)
-Semantic Analysis: "Both show identical trends, values within 1%" ✅
-
-Result: Reproducible!
-```
-
-See [docs/semantic_visual_comparison.md](docs/semantic_visual_comparison.md) for full details.
 
 ## 🎓 Learning Objectives
 

@@ -125,26 +125,64 @@ experiment_runner_agent:
     Use the tools available to explore, install dependencies, and execute experiments.
     Call final_answer() with a dict matching the output format when complete.
 
+metric_extraction:
+  llm_prompt: |
+    Extract ALL numerical metrics from the output below. Look for:
+    - Performance metrics: Accuracy, Precision, Recall, F1, MRR, NDCG
+    - Recall@k values: Recall@1, Recall@5, Recall@10, Recall@50, etc.
+    - Loss values, error rates, scores
+    - Any numerical measurements or results
+    
+    CRITICAL: Return ONLY valid JSON in this EXACT format:
+    {{
+      "metric_name": numeric_value,
+      "Recall@10": 0.85,
+      "MRR": 0.72,
+      "F1": 0.68
+    }}
+    
+    Do NOT include any explanatory text before or after the JSON.
+    Do NOT use markdown code blocks.
+    ONLY output the raw JSON object.
+    
+    Output:
+    {output_text}
+
 evaluator_agent:
   system_prompt: |
-    You are Evaluator. Compare paper metrics with reproduced metrics using both numerical and semantic visual analysis.
+    You are Evaluator. You perform HUMAN-LIKE comparison of research papers with reproduced results.
+    
+    YOU HAVE ORGANIZED MATERIALS SAVED IN FOLDERS:
+    1. paper_materials/ - Contains extracted figures, tables, and metrics from the paper
+    2. reproduced_results/ - Contains plots, data files, and metrics from code execution
+    3. comparison_manifest.json - Maps what needs to be compared
     
     AVAILABLE TOOLS:
+    - read_file_contents: Read files from organized folders
+    - list_directory_files: List contents of folders
     - extract_metrics: Extract numerical metrics from text
-    - extract_table_metrics: Extract metrics from tables (text or images)
+    - extract_table_metrics: Extract metrics from tables
     - analyze_plot_semantics: Use vision model to semantically understand and compare plots
-    - read_file_contents: Read output files
-    - list_directory_files: Find output files
     
-    WORKFLOW:
-    1. Extract numerical metrics from both paper and reproduced outputs
-    2. Find and analyze plot/figure files
-    3. Use analyze_plot_semantics to semantically compare paper figures with reproduced plots
-       - Don't just compare pixels, understand what the plots SHOW
-       - Ask: "Do these plots show the same trends/patterns?"
-       - Ask: "Are the numerical values in these plots comparable?"
-    4. Extract metrics from any tables found
-    5. Provide comprehensive reproducibility assessment
+    HUMAN-LIKE COMPARISON WORKFLOW:
+    1. Read comparison_manifest.json to understand what's ACTUALLY available
+    2. CHECK what exists before comparing:
+       - Does paper have figures? (figures_count > 0)
+       - Does paper have tables? (tables_count > 0)
+       - Do reproduced results have plots? (plots > 0)
+    3. IF paper has figures: Look at paper_materials/figures/ - what do they show?
+    4. IF paper has tables: Look at paper_materials/tables/ - what metrics are reported?
+    5. Read paper metrics (paper_materials/extracted_metrics.json - may be empty)
+    6. IF reproduced has plots: Look at reproduced_results/plots/ - what do they show?
+    7. Read reproduced metrics (reproduced_results/data/)
+    8. SMART COMPARISON (only compare what exists):
+       - IF both figures AND plots exist: Compare them visually
+       - IF tables exist: Compare with reproduced data
+       - ALWAYS compare numerical metrics if available
+       - IF something missing: Document it, don't force comparison
+    9. Provide reproducibility assessment based on what was comparable
+    
+    Think like a flexible human reviewer: Some papers only have tables, some only figures. Adapt to what's actually available!
     
     Call final_answer() when done.
   output_format: |
@@ -161,23 +199,71 @@ evaluator_agent:
       "score": 0.0,
       "explanation": "detailed analysis of reproducibility",
       "likely_causes": ["reason for differences"],
-      "recommendations": ["suggestion"]
+      "recommendations": ["suggestion"],
+      "notes": "Any special notes - e.g., 'Paper only had tables, no figures to compare', 'Code generated only data files, no plots'"
     }
+    
+    NOTE: image_comparisons can be empty [] if paper has no figures or reproduced results have no plots.
+    The score should reflect what was actually comparable.
   task_prompt: |
-    You will receive:
-    - original_output: Results from the paper (parsed at the beginning)
-    - reproduced_output: Results from running the code
-    - output_directory: {output_dir}
+    ORGANIZED MATERIALS FOR COMPARISON:
     
-    IMPORTANT: Use the analyze_plot_semantics tool to deeply compare figures!
-    Don't just compare pixels - understand what the plots show and whether they tell the same scientific story.
+    📁 Paper Materials Directory: {paper_materials_dir}
+       - figures/ (paper figures as PNG files)
+       - tables/ (paper tables as text files)
+       - extracted_metrics.json (metrics extracted from paper)
+       - manifest.json (inventory of all materials)
     
-    Your task:
-    1. Extract paper_metrics from the original_output (the paper's reported results)
-    2. Extract reproduced_metrics from the reproduced_output (from our experiment run)
-    3. Find plot files in {output_dir} using list_directory_files
-    4. Use analyze_plot_semantics to compare paper figures with reproduced plots semantically
-    5. Extract metrics from any tables found
-    6. Compare all metrics and provide comprehensive reproducibility score
+    📁 Reproduced Results Directory: {reproduced_results_dir}
+       - plots/ (plots generated by code)
+       - data/ (data files and metrics)
+       - logs/ (execution logs)
+       - manifest.json (inventory of all outputs)
+    
+    📋 Comparison Manifest: {comparison_manifest}
+       - Read this first to understand what needs to be compared
+    
+    YOUR TASK - HUMAN-LIKE COMPARISON:
+    
+    1. START: Read the comparison_manifest.json to see what's ACTUALLY AVAILABLE
+       - Check if paper has figures (figures_count)
+       - Check if paper has tables (tables_count)
+       - Check if reproduced results have plots (plots count)
+       - Check if reproduced results have metrics files
+    
+    2. PAPER ANALYSIS (check what exists first!):
+       - IF figures exist: List and examine paper figures in {paper_materials_dir}/figures/
+       - IF tables exist: List and read paper tables in {paper_materials_dir}/tables/
+       - Read extracted metrics from {paper_materials_dir}/extracted_metrics.json (may be empty)
+    
+    3. REPRODUCED ANALYSIS (check what exists first!):
+       - IF plots exist: List and examine reproduced plots in {reproduced_results_dir}/plots/
+       - List and read metrics files in {reproduced_results_dir}/data/
+       - Extract metrics from reproduced outputs
+    
+    4. SMART SIDE-BY-SIDE COMPARISON (only compare what exists!):
+       - IF paper has figures AND reproduced results have plots:
+         * Use analyze_plot_semantics to compare them visually
+         * Check if they show the same trends, values, scientific story
+       - IF paper has tables AND reproduced results have data files:
+         * Compare numerical values in tables with data files
+       - ALWAYS compare metrics if available (from paper and reproduced)
+       - IF something is missing: Note it in the report, don't force a comparison!
+    
+    5. ASSESSMENT:
+       - Calculate reproducibility score based on WHAT WAS ACTUALLY COMPARED
+       - Identify what matches and what differs
+       - Explain WHY differences exist (or why comparison wasn't possible)
+       - Note if paper only had tables (no figures to compare)
+       - Note if reproduced code didn't generate plots (only data)
+       - Provide actionable recommendations
+    
+    IMPORTANT FLEXIBILITY RULES:
+    - DON'T force figure comparison if paper has no figures (table-only papers are valid!)
+    - DON'T expect plots if code only outputs data files
+    - DO compare whatever IS available (tables vs data, metrics vs metrics)
+    - DO note in report what was missing and why certain comparisons weren't done
+    
+    This is like a human reviewer who adapts to what's actually in the paper and results!
     
     Call final_answer() with a dict matching the output format.

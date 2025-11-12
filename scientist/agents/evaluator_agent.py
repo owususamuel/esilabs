@@ -1,12 +1,10 @@
 
 from typing import Dict, Any, Optional, List
-import io
-import math
-import base64
-from PIL import Image
+import json
+import re
 
 from scientist.agents.base_agent import BaseAgent
-from scientist.tools.result_comparator import ResultComparator
+from scientist.tools.result_comparator import LLMResultComparator, ResultComparator
 from scientist.tools.tool_wrappers import ExtractMetrics
 
 
@@ -40,14 +38,17 @@ class EvaluatorAgent(BaseAgent):
             config_path=config_path
         )
         
-        # Initialize backing tools
-        self.comparator = ResultComparator()
+        # Initialize LLM-driven comparator (no hardcoded patterns)
+        self.comparator = LLMResultComparator(llm_client=self.model)
+        
+        # Legacy comparator for backward compatibility
+        self.legacy_comparator = ResultComparator()
         
         # Import file reading tools for autonomous output file discovery
         from scientist.tools.tool_wrappers import ReadFileContents, ListDirectoryFiles, AnalyzePlotSemantics, ExtractTableMetrics
         
         # Register autonomous tools with LLM access for intelligent extraction
-        self.register_tool("extract_metrics", None, ExtractMetrics(self.comparator, llm_client=self.model))
+        self.register_tool("extract_metrics", None, ExtractMetrics(self.legacy_comparator, llm_client=self.model))
         self.register_tool("read_file_contents", None, ReadFileContents())
         self.register_tool("list_directory_files", None, ListDirectoryFiles())
         self.register_tool("analyze_plot_semantics", None, AnalyzePlotSemantics(vision_model_client=self.model))
@@ -57,291 +58,234 @@ class EvaluatorAgent(BaseAgent):
         self.read_file_tool = ReadFileContents()
         self.list_dir_tool = ListDirectoryFiles()
     
-    def _load_image_from_base64(self, image_b64: str) -> Optional[Image.Image]:
-        
-        try:
-            raw = base64.b64decode(image_b64)
-            img = Image.open(io.BytesIO(raw))
-            return img.convert('RGB')
-        except Exception:
-            return None
+    # OLD REDUNDANT METHODS REMOVED
+    # Pixel-based image comparison is replaced by vision model semantic analysis
+    # Plot detection is now done by MaterialOrganizer
+    # Metric extraction from scattered files is now done by MaterialOrganizer
     
-    def _load_image_from_path(self, path: str) -> Optional[Image.Image]:
+    @staticmethod
+    def _flatten_metric_map(metrics: Any, prefix: str = "") -> Dict[str, float]:
+        """
+        Convert nested metric structures into a flat dict of floats.
+        Non-numeric values are skipped.
+        """
+        flattened: Dict[str, float] = {}
         
-        try:
-            img = Image.open(path)
-            return img.convert('RGB')
-        except Exception:
-            return None
-    
-    def _compute_ahash_similarity(self, img1: Image.Image, img2: Image.Image) -> float:
+        if not isinstance(metrics, dict):
+            return flattened
         
-        def ahash(img: Image.Image) -> List[int]:
-            g = img.resize((8, 8), Image.Resampling.LANCZOS).convert('L')
-            pixels = list(g.getdata())
-            avg = sum(pixels) / len(pixels) if pixels else 0
-            return [1 if p >= avg else 0 for p in pixels]
-        
-        h1 = ahash(img1)
-        h2 = ahash(img2)
-        same = sum(1 for a, b in zip(h1, h2) if a == b)
-        return same / 64.0
-    
-    def _compute_histogram_similarity(self, img1: Image.Image, img2: Image.Image) -> float:
-        
-        h1 = img1.histogram()
-        h2 = img2.histogram()
-        if not h1 or not h2 or len(h1) != len(h2):
-            return 0.0
-        dot = 0.0
-        n1 = 0.0
-        n2 = 0.0
-        for a, b in zip(h1, h2):
-            dot += float(a) * float(b)
-            n1 += float(a) * float(a)
-            n2 += float(b) * float(b)
-        denom = math.sqrt(n1) * math.sqrt(n2)
-        return (dot / denom) if denom > 0 else 0.0
-    
-    def _compute_psnr(self, img1: Image.Image, img2: Image.Image) -> float:
-        
-        s1 = img1.resize((128, 128), Image.Resampling.LANCZOS).convert('L')
-        s2 = img2.resize((128, 128), Image.Resampling.LANCZOS).convert('L')
-        p1 = list(s1.getdata())
-        p2 = list(s2.getdata())
-        if not p1 or not p2 or len(p1) != len(p2):
-            return 0.0
-        mse = 0.0
-        for a, b in zip(p1, p2):
-            d = float(a) - float(b)
-            mse += d * d
-        mse /= len(p1)
-        if mse == 0:
-            return 99.0
-        return 20.0 * math.log10(255.0 / math.sqrt(mse))
-    
-    def _compare_images(
-        self,
-        paper_figures_b64: List[str],
-        repo_image_paths: List[str]
-    ) -> Dict[str, Any]:
-        
-        paper_images: List[Image.Image] = []
-        for b64s in paper_figures_b64:
-            img = self._load_image_from_base64(b64s)
-            if img:
-                paper_images.append(img)
-        
-        repo_images: List[tuple[str, Image.Image]] = []
-        for p in repo_image_paths:
-            img = self._load_image_from_path(p)
-            if img:
-                repo_images.append((p, img))
-        
-        if not paper_images or not repo_images:
-            return {'comparisons': [], 'visual_score': 0.0}
-        
-        # Precompute pairwise similarities
-        pairs: List[Dict[str, Any]] = []
-        for i, pimg in enumerate(paper_images):
-            for rpath, rimg in repo_images:
-                try:
-                    ah = self._compute_ahash_similarity(pimg, rimg)
-                    hist = self._compute_histogram_similarity(pimg, rimg)
-                    psnr = self._compute_psnr(pimg, rimg)
-                    # Combined similarity emphasizes structure and distribution
-                    combined = 0.6 * ah + 0.4 * max(0.0, min(1.0, hist))
-                    pairs.append({
-                        'paper_index': i,
-                        'repo_path': rpath,
-                        'ahash': ah,
-                        'histogram_sim': hist,
-                        'psnr': psnr,
-                        'combined': combined
-                    })
-                except Exception:
-                    continue
-        
-        # Greedy one-to-one matching
-        pairs.sort(key=lambda x: (x['combined'], x['psnr']), reverse=True)
-        used_papers = set()
-        used_repo = set()
-        matches: List[Dict[str, Any]] = []
-        for item in pairs:
-            pi = item['paper_index']
-            rp = item['repo_path']
-            if pi in used_papers or rp in used_repo:
+        for raw_key, raw_value in metrics.items():
+            if raw_key is None:
                 continue
-            # Heuristic threshold: good visual match if combined >= 0.85 or PSNR >= 28
-            is_match = (item['combined'] >= 0.85) or (item['psnr'] >= 28.0)
-            matches.append({
-                'paper_figure_index': pi,
-                'repo_image_path': rp,
-                'ahash_similarity': item['ahash'],
-                'histogram_similarity': item['histogram_sim'],
-                'psnr': item['psnr'],
-                'combined_similarity': item['combined'],
-                'match': bool(is_match)
-            })
-            used_papers.add(pi)
-            used_repo.add(rp)
+            
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            
+            key_clean = re.sub(r'[^A-Za-z0-9@]+', '_', key).strip('_')
+            key_path = f"{prefix}{key_clean}" if not prefix else f"{prefix}_{key_clean}"
+            
+            if isinstance(raw_value, dict):
+                flattened.update(EvaluatorAgent._flatten_metric_map(raw_value, key_path))
+                continue
+            
+            value = EvaluatorAgent._coerce_to_float(raw_value)
+            if value is None:
+                continue
+            
+            flattened[key_path] = value
         
-        if not matches:
-            return {'comparisons': [], 'visual_score': 0.0}
-        
-        # Visual score: average combined similarity over matched items that passed threshold
-        matched = [m for m in matches if m['match']]
-        visual_score = (sum(m['combined_similarity'] for m in matched) / len(matched)) if matched else 0.0
-        return {'comparisons': matches, 'visual_score': visual_score}
+        return flattened
     
-    def _detect_plot_files(self, output_dir: str) -> List[Dict[str, Any]]:
-
-        from pathlib import Path
+    @staticmethod
+    def _coerce_to_float(value: Any) -> Optional[float]:
+        """Attempt to convert a value to float, handling numeric strings/percentages."""
+        if isinstance(value, (int, float)):
+            return float(value)
         
-        plot_info = []
-        plot_extensions = ['.png', '.jpg', '.jpeg', '.pdf', '.svg', '.eps']
-        
-        try:
-            output_path = Path(output_dir)
-            if not output_path.exists():
-                return []
-            
-            # Search for plot files recursively
-            for plot_file in output_path.rglob('*'):
-                if plot_file.is_file() and plot_file.suffix.lower() in plot_extensions:
-                    # Skip hidden files and system files
-                    if plot_file.name.startswith('.'):
-                        continue
-                    
-                    try:
-                        relative_path = plot_file.relative_to(output_path)
-                    except ValueError:
-                        relative_path = plot_file
-                    
-                    plot_info.append({
-                        'filename': plot_file.name,
-                        'path': str(relative_path),
-                        'full_path': str(plot_file),
-                        'size_kb': plot_file.stat().st_size / 1024,
-                        'extension': plot_file.suffix
-                    })
-            
-            if plot_info:
-                self.logger.info(f"✅ Found {len(plot_info)} plot files")
-            
-            return plot_info
-            
-        except Exception as e:
-            self.logger.error(f"Error detecting plot files: {e}")
-            return []
-    
-    def _extract_metrics_from_output_dir(self, output_dir: str) -> Optional[Dict[str, Any]]:
-
-        import json
-        from pathlib import Path
-        
-        try:
-            output_path = Path(output_dir)
-            if not output_path.exists():
-                self.logger.warning(f"Output directory does not exist: {output_dir}")
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
                 return None
             
-            # Search for common output directories
-            output_dir_names = ['outputs_all_methods', 'outputs', 'results', 'logs', 'output', 'experiments', 'runs', 'figures', 'plots']
+            is_percent = '%' in text
+            cleaned = text.replace('%', '').replace(',', '')
             
-            # Search for these directories
-            found_dirs = []
-            for dir_name in output_dir_names:
-                for match in output_path.rglob(dir_name):
-                    if match.is_dir():
-                        found_dirs.append(match)
+            match = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', cleaned)
+            if not match:
+                return None
             
-            # Also check the root directory itself
-            found_dirs.append(output_path)
+            try:
+                number = float(match.group(0))
+                if is_percent:
+                    number /= 100.0
+                return number
+            except ValueError:
+                return None
+        
+        return None
+    
+    def _extract_metrics_from_figures(self, paper_figures: List[Dict[str, Any]]) -> Dict[str, float]:
+        """
+        Extract numerical metrics from paper figures using vision model.
+        
+        Args:
+            paper_figures: List of figure dicts with 'image_base64', 'caption', 'figure_number', 'page_number'
             
-            # Search for JSON result files
-            result_files = []
-            for search_dir in found_dirs:
-                for json_file in search_dir.glob('*.json'):
-                    if any(name in json_file.name.lower() for name in ['result', 'metric', 'complete', 'summary']):
-                        result_files.append(json_file)
-            
-            # Detect plot files
-            plot_files = self._detect_plot_files(output_dir)
-            
-            metrics = {}
-            
-            # Extract numerical metrics from JSON files
-            if result_files:
-                # Prioritize complete_results.json if it exists
-                complete_results = [f for f in result_files if 'complete_results' in f.name.lower()]
-                if complete_results:
-                    result_files = complete_results[:1]  # Use the first complete_results.json
-                
-                # Read and extract metrics from the first suitable file
-                for result_file in result_files[:3]:  # Try up to 3 files
-                    try:
-                        self.logger.info(f"Reading metrics from: {result_file.relative_to(output_path)}")
-                        with open(result_file, 'r') as f:
-                            data = json.load(f)
+        Returns:
+            Dict of extracted metrics with figure context in key names
+        """
+        all_metrics = {}
+        
+        try:
+            for fig_idx, figure in enumerate(paper_figures):
+                try:
+                    image_b64 = figure.get('image_base64', '')
+                    caption = figure.get('caption', '')
+                    fig_num = figure.get('figure_number', str(fig_idx))
+                    
+                    if not image_b64:
+                        continue
+                    
+                    self.logger.info(f"  → Extracting metrics from Figure {fig_num}: {caption[:60]}...")
+                    
+                    # Use vision model to extract metrics from figure
+                    prompt = """Analyze this figure from a research paper and extract ALL numerical metrics shown.
+                    
+Look for:
+- Performance metrics (accuracy, precision, recall, F1, MRR, NDCG, etc.)
+- Recall@k values (e.g., Recall@1, Recall@10, Recall@50)
+- Tables embedded in figures
+- Bar charts, line plots with specific values
+- Any numbers reported in the figure
+
+Return ONLY a JSON object with metric names as keys and numerical values as floats.
+Example: {"Recall@10": 0.85, "MRR": 0.72, "F1": 0.68}
+
+If no metrics are found, return an empty JSON object: {}
+"""
+                    
+                    # Call vision model
+                    if self.model and hasattr(self.model, '__call__'):
+                        messages = [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+                            ]
+                        }]
                         
-                        # Extract metrics from the JSON structure
-                        numerical_metrics = self._flatten_metrics(data)
+                        response = self.model(messages)
+                        response_text = response if isinstance(response, str) else str(response)
                         
-                        if numerical_metrics:
-                            metrics.update(numerical_metrics)
-                            break
+                        # Extract JSON from response
+                        # Look for JSON object
+                        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
+                        if json_match:
+                            extracted = json.loads(json_match.group(0))
                             
-                    except Exception as e:
-                        self.logger.warning(f"Failed to read {result_file}: {e}")
-                        continue
+                            # Prefix metrics with figure number to avoid conflicts
+                            for metric_name, value in extracted.items():
+                                try:
+                                    # Add figure context to metric name
+                                    prefixed_key = f"Figure_{fig_num}_{metric_name}"
+                                    all_metrics[prefixed_key] = float(value)
+                                except (ValueError, TypeError):
+                                    continue
+                            
+                            if extracted:
+                                self.logger.info(f"    ✓ Found {len(extracted)} metrics in Figure {fig_num}")
+                        else:
+                            self.logger.debug(f"    No metrics found in Figure {fig_num}")
+                    
+                except Exception as e:
+                    self.logger.warning(f"  ⚠️ Error extracting from Figure {fig_num}: {e}")
+                    continue
             
-            # Add plot information to metrics
-            if plot_files:
-                metrics['_plot_files'] = plot_files
-                metrics['_has_plots'] = True
-                metrics['_plot_count'] = len(plot_files)
-                self.logger.info(f"✅ Detected {len(plot_files)} plot files as visual metrics")
-            
-            if not metrics:
-                self.logger.info("No result files or plots found in output directory")
-                return None
-            
-            return metrics if metrics else None
+            return all_metrics
             
         except Exception as e:
-            self.logger.error(f"Error extracting metrics from output dir: {e}", exc_info=True)
-            return None
+            self.logger.error(f"Error extracting metrics from figures: {e}", exc_info=True)
+            return {}
     
-    def _flatten_metrics(self, data: Any, prefix: str = '', max_depth: int = 5) -> Dict[str, float]:
+    def _extract_metrics_from_tables(self, paper_tables: List[Dict[str, Any]]) -> Dict[str, float]:
+        """
+        Extract numerical metrics from paper tables using text parsing.
+        
+        Args:
+            paper_tables: List of table dicts with 'content', 'caption', 'table_number', 'page_number'
+            
+        Returns:
+            Dict of extracted metrics with table context in key names
+        """
+        all_metrics = {}
+        
+        try:
+            for tbl_idx, table in enumerate(paper_tables):
+                try:
+                    content = table.get('content', '')
+                    caption = table.get('caption', '')
+                    tbl_num = table.get('table_number', str(tbl_idx))
+                    
+                    if not content:
+                        continue
+                    
+                    self.logger.info(f"  → Extracting metrics from Table {tbl_num}: {caption[:60]}...")
+                    
+                    # Use LLM to intelligently extract metrics from table text
+                    prompt = f"""Analyze this table from a research paper and extract ALL numerical metrics shown.
 
-        metrics = {}
-        
-        if max_depth == 0:
-            return metrics
-        
-        if isinstance(data, dict):
-            for key, value in data.items():
-                new_prefix = f"{prefix}/{key}" if prefix else key
-                
-                # Skip very deep nesting or non-informative keys
-                if '.' in key or len(new_prefix.split('/')) > 6:
+Table Caption: {caption}
+
+Table Content:
+{content[:2000]}
+
+Extract all performance metrics, scores, and measurements. Look for:
+- Accuracy, Precision, Recall, F1, MRR, NDCG metrics
+- Recall@k values (e.g., Recall@1, Recall@10, Recall@50)
+- Percentages, ratios, scores
+- Any numerical performance measurements
+
+Return ONLY a JSON object with metric names as keys and numerical values as floats.
+Example: {{"Recall@10": 0.85, "MRR": 0.72, "F1_Score": 0.68}}
+
+If no metrics are found, return an empty JSON object: {{}}
+"""
+                    
+                    # Call LLM to extract
+                    if self.model and hasattr(self.model, '__call__'):
+                        messages = [{"role": "user", "content": prompt}]
+                        response = self.model(messages)
+                        response_text = response if isinstance(response, str) else str(response)
+                        
+                        # Extract JSON from response
+                        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
+                        if json_match:
+                            extracted = json.loads(json_match.group(0))
+                            
+                            # Prefix metrics with table number to avoid conflicts
+                            for metric_name, value in extracted.items():
+                                try:
+                                    # Add table context to metric name
+                                    prefixed_key = f"Table_{tbl_num}_{metric_name}"
+                                    all_metrics[prefixed_key] = float(value)
+                                except (ValueError, TypeError):
+                                    continue
+                            
+                            if extracted:
+                                self.logger.info(f"    ✓ Found {len(extracted)} metrics in Table {tbl_num}")
+                        else:
+                            self.logger.debug(f"    No metrics found in Table {tbl_num}")
+                    
+                except Exception as e:
+                    self.logger.warning(f"  ⚠️ Error extracting from Table {tbl_num}: {e}")
                     continue
-                
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    # Store numerical values
-                    metrics[new_prefix] = float(value)
-                elif isinstance(value, dict):
-                    # Recursively flatten nested dicts
-                    nested = self._flatten_metrics(value, new_prefix, max_depth - 1)
-                    metrics.update(nested)
-                elif isinstance(value, list) and value and isinstance(value[0], dict):
-                    # Handle lists of dicts (take first few items)
-                    for idx, item in enumerate(value[:3]):
-                        nested = self._flatten_metrics(item, f"{new_prefix}[{idx}]", max_depth - 1)
-                        metrics.update(nested)
-        
-        return metrics
+            
+            return all_metrics
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting metrics from tables: {e}", exc_info=True)
+            return {}
     
     def execute(self, task: Dict[str, Any]) -> Dict[str, Any]:
 
@@ -355,7 +299,7 @@ class EvaluatorAgent(BaseAgent):
             }
         
         try:
-            self.logger.info("🤖 Autonomous agent evaluating reproducibility...")
+            self.logger.info("🤖 LLM-driven comparison (no hardcoded patterns)...")
             
             # Convert to strings if needed
             paper_str = str(paper_results) if not isinstance(paper_results, str) else paper_results
@@ -368,40 +312,101 @@ class EvaluatorAgent(BaseAgent):
             original_metrics = task.get('original_metrics')
             reproduced_metrics = task.get('reproduced_metrics')
             
-            # Try to find and read actual output files if output directory is provided
+            # Use organized reproduced results directory instead of searching
             has_plots = False
             plot_info = []
-            if output_dir and output_dir != 'Not provided' and not isinstance(reproduced_metrics, dict):
-                self.logger.info(f"🔍 Searching for output files in: {output_dir}")
-                reproduced_metrics = self._extract_metrics_from_output_dir(output_dir)
-                if reproduced_metrics:
-                    # Check if plot files were detected
-                    has_plots = reproduced_metrics.get('_has_plots', False)
-                    plot_info = reproduced_metrics.get('_plot_files', [])
-                    
-                    # Remove metadata keys before comparison
-                    reproduced_metrics = {k: v for k, v in reproduced_metrics.items() if not k.startswith('_')}
-                    
-                    if reproduced_metrics:
-                        self.logger.info(f"✅ Extracted {len(reproduced_metrics)} numerical metrics from output files")
-                    if has_plots:
-                        self.logger.info(f"✅ Detected {len(plot_info)} plot-based metrics")
-                else:
-                    self.logger.warning("⚠️ No metrics found in output files, falling back to text extraction")
+            reproduced_results_dir_path = task.get('reproduced_results_dir')
             
-            # Fallback to LLM extraction if no structured metrics found
-            if not isinstance(original_metrics, dict):
-                self.logger.info("Using LLM to extract metrics from paper results...")
-                original_metrics = self.comparator.extract_metrics(paper_str, llm_client=self.model)
+            if reproduced_results_dir_path and reproduced_results_dir_path != 'Not provided':
+                self.logger.info(f"🔍 Reading organized reproduced results from: {reproduced_results_dir_path}")
+                # Read metrics from organized folder
+                from pathlib import Path
+                import json
+                
+                try:
+                    results_path = Path(reproduced_results_dir_path)
+                    
+                    # Read plot files from organized plots folder
+                    plots_dir = results_path / "plots"
+                    if plots_dir.exists():
+                        plot_info = [
+                            {
+                                'filename': p.name,
+                                'full_path': str(p),
+                                'size_kb': p.stat().st_size / 1024
+                            }
+                            for p in plots_dir.iterdir() if p.is_file()
+                        ]
+                        has_plots = len(plot_info) > 0
+                        if has_plots:
+                            self.logger.info(f"✅ Found {len(plot_info)} organized plots")
+                    
+                    # Read metrics from organized data folder
+                    data_dir = results_path / "data"
+                    if data_dir.exists() and not isinstance(reproduced_metrics, dict):
+                        for json_file in data_dir.glob('*.json'):
+                            try:
+                                with open(json_file, 'r') as f:
+                                    data = json.load(f)
+                                    if isinstance(data, dict):
+                                        reproduced_metrics = data
+                                        self.logger.info(f"✅ Read metrics from: {json_file.name}")
+                                        break
+                            except Exception as e:
+                                self.logger.warning(f"Could not read {json_file.name}: {e}")
+                                continue
+                
+                except Exception as e:
+                    self.logger.warning(f"Error reading organized results: {e}")
             
-            if not isinstance(reproduced_metrics, dict) or not reproduced_metrics:
-                self.logger.info("Using LLM to extract metrics from reproduced results text...")
-                reproduced_metrics = self.comparator.extract_metrics(repro_str, llm_client=self.model)
-
-            # Compute comparison metrics
-            comparisons = self.comparator.compare_metrics(original_metrics, reproduced_metrics, llm_client=self.model)
-            overall_score = self.comparator.calculate_reproducibility_score(comparisons)
-            comparison_report = self.comparator.generate_comparison_report(comparisons, overall_score)
+            # LOAD SAVED PAPER METRICS (extracted during paper parsing, not re-extracted here!)
+            paper_extracted_metrics = task.get('paper_extracted_metrics', {})
+            
+            if paper_extracted_metrics:
+                self.logger.info(f"📊 Loading {len(paper_extracted_metrics)} SAVED paper metrics (no re-extraction needed)")
+            else:
+                self.logger.warning("⚠️ No saved paper metrics found - paper parser may have failed to extract them")
+            
+            # Build structured paper data for LLM comparison
+            paper_data = {
+                'experimental_results': paper_str,
+                'tables': task.get('paper_tables', []),
+                'figures': task.get('paper_figures', []),
+                'evaluation_metrics': task.get('evaluation_metrics', []),
+                'pre_extracted_metrics': paper_extracted_metrics  # Use saved metrics
+            }
+            
+            # Build structured reproduced data
+            reproduced_data = {
+                'stdout': repro_str,
+                'metrics': reproduced_metrics if isinstance(reproduced_metrics, dict) else {},
+                'output_files': [],
+                'plots': plot_info if has_plots else []
+            }
+            
+            # Output files are now organized in reproduced_results_dir
+            # No need to search scattered files - MaterialOrganizer already organized them
+            
+            # Use LLM-driven comparison (uses saved paper metrics, no re-extraction!)
+            self.logger.info("🤖 Comparing SAVED paper metrics with reproduced results...")
+            comparison_result = self.comparator.compare_results(paper_data, reproduced_data)
+            
+            # Extract results
+            overall_score = comparison_result.reproducibility_score
+            original_metrics = comparison_result.paper_metrics
+            reproduced_metrics = comparison_result.reproduced_metrics
+            comparisons = comparison_result.metric_comparisons
+            
+            # Build comparison report for backward compatibility
+            comparison_report = {
+                'overall_score': overall_score,
+                'total_metrics': comparison_result.total_metrics_compared,
+                'metrics_matched': comparison_result.metrics_matched,
+                'comparisons': comparisons,
+                'analysis': comparison_result.analysis,
+                'likely_causes': comparison_result.likely_causes,
+                'recommendations': comparison_result.recommendations
+            }
 
             # Load task prompt from YAML
             task_prompt_template = BaseAgent._load_task_prompt('evaluator_agent')
@@ -420,52 +425,29 @@ class EvaluatorAgent(BaseAgent):
                 if len(plot_info) > 10:
                     plot_summary += f"  ... and {len(plot_info) - 10} more plots"
             
-            # Visual comparison (paper figures vs produced plots)
-            # Build structured mapping: Figure 1 -> reproduced_plot_1.png
+            # Visual comparison will be done by LLM using organized folders
+            # LLM will use analyze_plot_semantics tool to compare figures from both folders
             image_comparisons: List[Dict[str, Any]] = []
             visual_score: float = 0.0
             figure_mapping: List[Dict[str, Any]] = []
             
-            try:
-                paper_figures_input = task.get('paper_figures') or []
-                paper_b64_list: List[str] = []
-                paper_fig_metadata: List[Dict[str, Any]] = []
-                
-                for fig in paper_figures_input:
-                    if isinstance(fig, dict):
-                        b64v = fig.get('image_base64') or fig.get('b64') or fig.get('image')
-                        if isinstance(b64v, str):
-                            paper_b64_list.append(b64v)
-                            # Store metadata for structured mapping
-                            paper_fig_metadata.append({
-                                'figure_number': fig.get('figure_number', len(paper_b64_list)),
-                                'caption': fig.get('caption', ''),
-                                'page_number': fig.get('page_number', 0)
-                            })
-                
-                repo_paths: List[str] = [p['full_path'] for p in (plot_info or []) if isinstance(p, dict) and p.get('full_path')]
-                
-                if paper_b64_list and repo_paths:
-                    vis = self._compare_images(paper_b64_list, repo_paths)
-                    image_comparisons = vis.get('comparisons', [])
-                    visual_score = float(vis.get('visual_score', 0.0))
-                    
-                    # Create structured mapping
-                    for comp in image_comparisons:
-                        paper_idx = comp.get('paper_figure_index', 0)
-                        if paper_idx < len(paper_fig_metadata):
-                            metadata = paper_fig_metadata[paper_idx]
-                            figure_mapping.append({
-                                'paper_figure': f"Figure {metadata['figure_number']}",
-                                'paper_caption': metadata['caption'],
-                                'paper_page': metadata['page_number'],
-                                'reproduced_file': comp.get('repo_image_path', ''),
-                                'similarity_score': comp.get('combined_similarity', 0.0),
-                                'match': comp.get('match', False)
-                            })
-            except Exception:
-                # Non-fatal
-                pass
+            # Build simple mapping for LLM to know what's available
+            paper_figures_input = task.get('paper_figures') or []
+            for fig in paper_figures_input:
+                if isinstance(fig, dict):
+                    figure_mapping.append({
+                        'paper_figure': f"Figure {fig.get('figure_number', '?')}",
+                        'paper_caption': fig.get('caption', ''),
+                        'available_for_comparison': True
+                    })
+            
+            # Note: Actual comparison will be done by LLM using the organized folders
+            # and the analyze_plot_semantics tool
+            
+            # Get organized material paths
+            paper_materials_dir = task.get('paper_materials_dir', 'Not provided')
+            reproduced_results_dir = task.get('reproduced_results_dir', 'Not provided')
+            comparison_manifest = task.get('comparison_manifest', 'Not provided')
             
             # Fill in template variables
             agent_task = BaseAgent._render_template(
@@ -476,6 +458,9 @@ class EvaluatorAgent(BaseAgent):
                     "output_dir": str(output_dir),
                     "code_notes": code_notes,
                     "doc_notes": doc_notes,
+                    "paper_materials_dir": str(paper_materials_dir),
+                    "reproduced_results_dir": str(reproduced_results_dir),
+                    "comparison_manifest": str(comparison_manifest),
                 }
             )
             
@@ -488,55 +473,88 @@ class EvaluatorAgent(BaseAgent):
             
             self.logger.info("✅ Agent completed autonomous evaluation")
             
-            # Try to parse minimal JSON from agent response for recommendations/causes
-            import json as _json
-            import re as _re
-            import ast as _ast
-            analysis_text: str = agent_response
-            likely_causes: List[str] = []
-            recommendations: List[str] = []
-            try:
-                json_match = _re.search(r'\{[\s\S]*\}', agent_response)
-                if json_match:
-                    parsed_response = None
-                    json_blob = json_match.group(0)
-                    try:
-                        parsed_response = _json.loads(json_blob)
-                    except _json.JSONDecodeError:
-                        try:
-                            parsed_response = _ast.literal_eval(json_blob)
-                        except (ValueError, SyntaxError):
-                            parsed_response = None
-                    if isinstance(parsed_response, dict):
-                        raw_analysis = parsed_response.get('analysis')
-                        if isinstance(raw_analysis, (dict, list)):
-                            analysis_text = _json.dumps(raw_analysis, ensure_ascii=False)
-                        elif raw_analysis is not None:
-                            analysis_text = str(raw_analysis)
-                        if isinstance(parsed_response.get('likely_causes'), list):
-                            likely_causes = [str(x) for x in parsed_response.get('likely_causes', [])]
-                        if isinstance(parsed_response.get('recommendations'), list):
-                            recommendations = [str(x) for x in parsed_response.get('recommendations', [])]
-                    elif isinstance(parsed_response, list) and parsed_response:
-                        first_item = parsed_response[0]
-                        if isinstance(first_item, dict):
-                            raw_analysis = first_item.get('analysis')
-                            if raw_analysis is not None:
-                                analysis_text = str(raw_analysis)
-                            if isinstance(first_item.get('likely_causes'), list):
-                                likely_causes = [str(x) for x in first_item.get('likely_causes', [])]
-                            if isinstance(first_item.get('recommendations'), list):
-                                recommendations = [str(x) for x in first_item.get('recommendations', [])]
-            except Exception:
-                # Non-fatal; keep text-only analysis
-                pass
+            # Use agent's final answer if it's a dict with evaluation results
+            if isinstance(agent_response, dict):
+                # Agent provided structured evaluation - use it!
+                self.logger.info("📊 Using agent's autonomous evaluation results")
+                
+                # Extract agent's scores and analysis
+                agent_score = agent_response.get('score', overall_score)
+                agent_visual_score = agent_response.get('visual_score', visual_score)
+                agent_explanation = agent_response.get('explanation', comparison_result.analysis)
+                agent_causes = agent_response.get('likely_causes', comparison_result.likely_causes)
+                agent_recommendations = agent_response.get('recommendations', comparison_result.recommendations)
+                
+                # Use agent's metrics if provided, otherwise fall back to comparison_result
+                agent_paper_metrics = agent_response.get('paper_metrics', original_metrics)
+                agent_reproduced_metrics = agent_response.get('reproduced_metrics', reproduced_metrics)
+                agent_comparisons = agent_response.get('comparisons', comparisons)
+                agent_image_comparisons = agent_response.get('image_comparisons', image_comparisons)
+                
+                # Use agent's values
+                final_score = agent_score
+                final_visual_score = agent_visual_score
+                analysis_text = agent_explanation
+                likely_causes = agent_causes
+                recommendations = agent_recommendations
+                original_metrics = agent_paper_metrics
+                reproduced_metrics = agent_reproduced_metrics
+                comparisons = agent_comparisons
+                if agent_image_comparisons:
+                    image_comparisons = agent_image_comparisons
+                
+                # Recalculate metrics_matched from agent's comparisons
+                if agent_comparisons and isinstance(agent_comparisons, list):
+                    metrics_matched = 0
+                    total_metrics = 0
+                    for comparison in agent_comparisons:
+                        if not isinstance(comparison, dict):
+                            continue
+                        total_metrics += 1
+                        diff = comparison.get('difference')
+                        if diff is None:
+                            original_value = comparison.get('original')
+                            reproduced_value = comparison.get('reproduced')
+                            if (
+                                isinstance(original_value, (int, float))
+                                and isinstance(reproduced_value, (int, float))
+                            ):
+                                diff = reproduced_value - original_value
+                        if isinstance(diff, str):
+                            try:
+                                diff = float(diff)
+                            except (TypeError, ValueError):
+                                diff = None
+                        if isinstance(diff, (int, float)) and abs(diff) < 0.01:
+                            metrics_matched += 1
+                else:
+                    metrics_matched = comparison_report.get('metrics_matched', 0)
+                    total_metrics = comparison_report.get('total_metrics', 0)
+                
+            else:
+                # Agent didn't return structured evaluation - use LLM comparison results
+                self.logger.warning("⚠️  Agent response not structured, using LLM comparison results")
+                final_score = overall_score
+                final_visual_score = visual_score
+                analysis_text = comparison_result.analysis
+                likely_causes = comparison_result.likely_causes
+                recommendations = comparison_result.recommendations
+                metrics_matched = comparison_report.get('metrics_matched', 0)
+                total_metrics = comparison_report.get('total_metrics', 0)
+
+            # Normalize metric structures for downstream reporting
+            original_metrics = self._flatten_metric_map(original_metrics)
+            reproduced_metrics = self._flatten_metric_map(reproduced_metrics)
+
+            if total_metrics == 0:
+                final_score = None
 
             # Normalize output contract expected by orchestrator
             result = {
                 'success': True,
-                'final_reproducibility_score': comparison_report.get('overall_score', overall_score),
-                'metrics_matched': comparison_report.get('metrics_matched', 0),
-                'total_metrics': comparison_report.get('total_metrics', 0),
+                'final_reproducibility_score': final_score,
+                'metrics_matched': metrics_matched,
+                'total_metrics': total_metrics,
                 'comparison_details': comparison_report,
                 'original_metrics': original_metrics,
                 'reproduced_metrics': reproduced_metrics,
@@ -544,13 +562,13 @@ class EvaluatorAgent(BaseAgent):
                 'plot_files': plot_info if has_plots else [],
                 'plot_count': len(plot_info) if has_plots else 0,
                 'image_comparisons': image_comparisons,
-                'visual_score': visual_score,
+                'visual_score': final_visual_score,
                 'figure_mapping': figure_mapping,  # Structured mapping: Figure X -> reproduced file
                 'analysis': analysis_text,
                 'likely_causes': likely_causes,
                 'recommendations': recommendations,
                 'execution_type': 'autonomous',
-                'note': 'Deterministic scoring + semantic visual analysis via vision model'
+                'note': 'Deterministic scoring + semantic visual analysis via vision model + Agent autonomous evaluation'
             }
             
             self.log_execution("autonomous_evaluation", result)

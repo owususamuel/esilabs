@@ -1,345 +1,550 @@
 """
-Result Comparator Tool - Compares original vs reproduced experimental results.
-Calculates similarity metrics and identifies discrepancies.
+LLM-Driven Result Comparator - Intelligent comparison without hardcoded patterns.
+
+The LLM handles all comparison logic given paper tables/results and reproduced results.
 """
 
 import json
 import logging
-from typing import Dict, Any, List, Tuple, Optional
-from dataclasses import dataclass
 import re
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class MetricComparison:
-    """Comparison for a single metric."""
+class ComparisonResult:
+    """Result of LLM-driven comparison."""
     
-    metric_name: str
-    original_value: float
-    reproduced_value: float
+    # Overall scores
+    reproducibility_score: float  # 0-1
+    metrics_matched: int
+    total_metrics_compared: int
     
-    # Metrics
-    absolute_difference: float
-    relative_difference: float  # Percentage
-    match_score: float  # 0-1: how closely they match
+    # Detailed comparisons
+    metric_comparisons: List[Dict[str, Any]]  # Each: {metric, paper_value, reproduced_value, match, difference}
     
-    is_close: bool  # Within acceptable threshold
+    # Analysis
+    analysis: str
+    likely_causes: List[str]
+    recommendations: List[str]
+    
+    # Raw data for transparency
+    paper_metrics: Dict[str, float]
+    reproduced_metrics: Dict[str, float]
 
 
-class ResultComparator:
+class LLMResultComparator:
+    """
+    LLM-driven result comparator with no hardcoded patterns.
     
-    # Acceptable thresholds for metric matching
-    DEFAULT_THRESHOLDS = {
-        'accuracy': 0.01,  # 1% tolerance for accuracy
-        'loss': 0.05,      # 5% tolerance for loss
-        'f1': 0.01,        # 1% tolerance for F1
-        'auc': 0.02,       # 2% tolerance for AUC
-        'default': 0.1     # 10% tolerance for unknown metrics
-    }
+    The LLM:
+    1. Receives paper results (tables, figures, text) and reproduced results
+    2. Intelligently identifies which metrics correspond to each other
+    3. Compares them and calculates reproducibility score
+    4. Provides detailed analysis
+    """
     
-    def __init__(self, thresholds: Optional[Dict[str, float]] = None):
+    def __init__(self, llm_client):
+        """
+        Initialize with LLM client.
         
-        self.thresholds = {**self.DEFAULT_THRESHOLDS}
-        if thresholds:
-            self.thresholds.update(thresholds)
-        
+        Args:
+            llm_client: LLM client that can be called with messages
+        """
+        self.llm = llm_client
         self.logger = logger
     
-    # --- Metric key normalization helpers ---
-    def _normalize_metric_key(self, key: str) -> str:
+    def compare_results(
+        self,
+        paper_data: Dict[str, Any],
+        reproduced_data: Dict[str, Any]
+    ) -> ComparisonResult:
         """
-        Normalize heterogeneous metric keys into canonical names so we can match
-        paper vs reproduced metrics even when their paths differ.
+        Compare paper results with reproduced results using LLM intelligence.
         
-        Canonicalization examples:
-        - "sentence/minimal.retrieval.bm25.metrics.recall.10" -> "bm25_recall@10"
-        - "bm25.metrics.mrr" -> "bm25_mrr"
-        - "Recall@10" -> "recall@10"
+        Args:
+            paper_data: {
+                'tables': [{'caption': '...', 'content': '...'}, ...],
+                'figures': [{'caption': '...', 'image_base64': '...'}, ...],
+                'experimental_results': 'text description of results',
+                'evaluation_metrics': ['accuracy', 'f1', ...]
+            }
+            reproduced_data: {
+                'output_files': [{'path': '...', 'content': '...'}, ...],
+                'metrics': {'metric_name': value, ...},
+                'stdout': 'command output',
+                'plots': [{'path': '...'}, ...]
+            }
+        
+        Returns:
+            ComparisonResult with scores, analysis, and recommendations
         """
-        k = (key or "").strip().lower()
-        if not k:
-            return k
+        self.logger.info("🤖 LLM comparing paper results with reproduced results...")
         
-        # Standardize separators
-        k = k.replace('\\', '/')
-        for sep in [' ', '\t']:
-            k = k.replace(sep, '')
-        # Keep '/' for context detection but we'll also search raw text
+        # Step 1: Extract metrics from paper using LLM
+        paper_metrics = self._extract_paper_metrics(paper_data)
+        self.logger.info(f"  📊 Extracted {len(paper_metrics)} metrics from paper")
         
-        has_bm25 = 'bm25' in k
+        # Step 2: Extract metrics from reproduced results using LLM
+        reproduced_metrics = self._extract_reproduced_metrics(reproduced_data)
+        self.logger.info(f"  📊 Extracted {len(reproduced_metrics)} metrics from reproduced results")
         
-        base_name = None
+        # Step 3: Let LLM compare and analyze
+        comparison = self._llm_compare(paper_metrics, reproduced_metrics, paper_data, reproduced_data)
         
-        # Detect MRR
-        if 'mrr' in k:
-            base_name = 'mrr'
+        self.logger.info(f"  ✅ Reproducibility score: {comparison.reproducibility_score:.1%}")
         
-        # Detect recall@K
-        if base_name is None and 'recall' in k:
-            # Match recall followed by @, ., _, /, or nothing then a number
-            m = re.search(r'recall(?:@|[._/])?(\d+)', k)
-            if m:
-                base_name = f"recall@{m.group(1)}"
-            else:
-                # Generic recall without K
-                base_name = 'recall'
-        
-        # Other common IR metrics (expandable)
-        if base_name is None and 'ndcg' in k:
-            m = re.search(r'ndcg(?:@|[._/])?(\d+)', k)
-            base_name = f"ndcg@{m.group(1)}" if m else 'ndcg'
-        if base_name is None and 'precision' in k:
-            m = re.search(r'precision(?:@|[._/])?(\d+)', k)
-            base_name = f"precision@{m.group(1)}" if m else 'precision'
-        if base_name is None and 'f1' in k:
-            base_name = 'f1'
-        if base_name is None and 'accuracy' in k:
-            base_name = 'accuracy'
-        if base_name is None and 'auc' in k:
-            base_name = 'auc'
-        if base_name is None and 'loss' in k:
-            base_name = 'loss'
-        
-        if base_name:
-            return f"bm25_{base_name}" if has_bm25 else base_name
-        
-        # Fallback: strip path-like structure to the last token
-        tail = k.split('/')[-1]
-        # Replace remaining dots with underscores
-        tail = tail.replace('.', '_')
-        return tail
+        return comparison
     
-    def _canonicalize_metrics(self, metrics: Dict[str, float]) -> Dict[str, float]:
+    def _extract_paper_metrics(self, paper_data: Dict[str, Any]) -> Dict[str, float]:
         """
-        Convert a dict of metrics into canonical names. If multiple raw keys map to the
-        same canonical name, prefer ones that mention 'bm25' explicitly.
+        Use LLM to extract all metrics from paper tables, figures, and text.
+        
+        If pre_extracted_metrics are provided (from paper parsing stage), use those instead.
         """
-        if not isinstance(metrics, dict):
-            return {}
+        # CHECK FOR SAVED METRICS FIRST (from paper parsing stage)
+        pre_extracted = paper_data.get('pre_extracted_metrics', {})
+        if pre_extracted:
+            self.logger.info(f"✅ Using {len(pre_extracted)} pre-extracted paper metrics (no re-extraction)")
+            return pre_extracted
         
-        canonical: Dict[str, float] = {}
-        chosen_has_bm25: Dict[str, bool] = {}
+        # FALLBACK: Extract metrics if not pre-extracted
+        self.logger.info("📊 No pre-extracted metrics found, extracting from paper data...")
         
-        for raw_key, value in metrics.items():
-            try:
-                numeric_value = float(value)
-            except (TypeError, ValueError):
+        # Build context from all available paper data
+        context_parts = []
+        
+        # Collect deterministic metrics from tables if present
+        combined_metrics: Dict[str, float] = {}
+        table_metrics = self._collect_table_metrics(paper_data.get('tables'))
+        if table_metrics:
+            self.logger.info(f"  📥 Collected {len(table_metrics)} metrics directly from tables")
+            combined_metrics.update(table_metrics)
+
+        # Add experimental results text
+        if paper_data.get('experimental_results'):
+            context_parts.append(f"EXPERIMENTAL RESULTS TEXT:\n{paper_data['experimental_results'][:3000]}")
+        
+        # Add table contents
+        if paper_data.get('tables'):
+            context_parts.append("\nTABLES:")
+            for i, table in enumerate(paper_data['tables'][:5]):  # Limit to 5 tables
+                caption = table.get('caption', '')
+                content = table.get('content', '')
+                context_parts.append(f"\nTable {i+1} - {caption}\n{content[:1000]}")
+        
+        # Add evaluation metrics mentioned
+        if paper_data.get('evaluation_metrics'):
+            context_parts.append(f"\nMETRICS USED: {', '.join(paper_data['evaluation_metrics'])}")
+        
+        context = '\n\n'.join(context_parts)
+        
+        # Prompt for extraction
+        prompt = f"""Extract ALL numerical performance metrics from this research paper's results.
+
+{context}
+
+Extract every metric with its numerical value. Look for:
+- Performance metrics: Accuracy, Precision, Recall, F1, MRR, NDCG, AUC
+- Recall@k values: Recall@1, Recall@10, Recall@50
+- Any numerical scores, percentages, or measurements
+
+Return ONLY a JSON object with metric names as keys and numerical values:
+{{
+  "Recall@10": 0.85,
+  "MRR": 0.72,
+  "F1_Score": 0.68
+}}
+
+If no metrics found, return empty object: {{}}
+"""
+        
+        try:
+            response = self._call_llm(prompt)
+            metrics = self._parse_json_response(response)
+            normalized = self._normalize_metric_values(metrics)
+            if normalized:
+                self.logger.info(f"  🤖 LLM extracted {len(normalized)} metrics from paper text")
+            combined_metrics.update(normalized)
+            return combined_metrics
+        except Exception as e:
+            self.logger.error(f"Error extracting paper metrics: {e}")
+            return combined_metrics
+    
+    def _extract_reproduced_metrics(self, reproduced_data: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Use LLM to extract all metrics from reproduced experiment outputs.
+        """
+        # Build context from reproduced data
+        context_parts = []
+        
+        # Add pre-extracted metrics if available
+        if reproduced_data.get('metrics'):
+            context_parts.append(f"EXTRACTED METRICS:\n{json.dumps(reproduced_data['metrics'], indent=2)}")
+        
+        # Add stdout/stderr
+        if reproduced_data.get('stdout'):
+            context_parts.append(f"\nCOMMAND OUTPUT:\n{reproduced_data['stdout'][:2000]}")
+        
+        # Add output file contents
+        if reproduced_data.get('output_files'):
+            context_parts.append("\nOUTPUT FILES:")
+            for i, file_info in enumerate(reproduced_data['output_files'][:3]):
+                path = file_info.get('path', '')
+                content = file_info.get('content', '')
+                context_parts.append(f"\nFile: {path}\n{content[:1000]}")
+        
+        context = '\n\n'.join(context_parts)
+        
+        prompt = f"""Extract ALL numerical performance metrics from these reproduced experiment results.
+
+{context}
+
+Extract every metric with its numerical value. Return ONLY a JSON object:
+{{
+  "Recall@10": 0.83,
+  "MRR": 0.70,
+  "F1_Score": 0.65
+}}
+
+If no metrics found, return empty object: {{}}
+"""
+        
+        try:
+            response = self._call_llm(prompt)
+            metrics = self._parse_json_response(response)
+            return self._normalize_metric_values(metrics)
+        except Exception as e:
+            self.logger.error(f"Error extracting reproduced metrics: {e}")
+            return reproduced_data.get('metrics', {})
+    
+    def _normalize_metric_values(self, metrics: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Convert metric values returned by the LLM into floats, handling string formats.
+        """
+        normalized: Dict[str, float] = {}
+        
+        for raw_key, raw_value in (metrics or {}).items():
+            if raw_key is None:
                 continue
             
-            norm = self._normalize_metric_key(str(raw_key))
-            has_bm25 = 'bm25' in str(raw_key).lower()
+            key = str(raw_key).strip()
+            if not key:
+                continue
             
-            if norm not in canonical:
-                canonical[norm] = numeric_value
-                chosen_has_bm25[norm] = has_bm25
-            else:
-                # Prefer bm25-specific over generic if conflict
-                if has_bm25 and not chosen_has_bm25.get(norm, False):
-                    canonical[norm] = numeric_value
-                    chosen_has_bm25[norm] = True
+            value = self._to_float(raw_value)
+            if value is None:
+                continue
+            
+            normalized[key] = value
         
-        return canonical
-    
-    def _llm_align_metrics(
-        self,
-        original: Dict[str, float],
-        reproduced: Dict[str, float],
-        llm_client
-    ) -> Dict[str, str]:
-        """
-        Ask the LLM to align metric keys between original and reproduced dicts.
-
-        """
-        # Limit to avoid overly long prompts
-        def sample_dict(d: Dict[str, float], max_items: int = 50) -> Dict[str, float]:
-            items = list(d.items())[:max_items]
-            return {k: v for k, v in items}
-        
-        orig_sample = sample_dict(original)
-        repro_sample = sample_dict(reproduced)
-        
-        import json as _json
-        prompt = (
-            "You are aligning metric keys between two result dictionaries from experiments.\n"
-            "Given ORIGINAL and REPRODUCED metric dicts (keys with floats), produce a JSON mapping from\n"
-            "original metric keys to the best matching reproduced metric keys. Only map comparable metrics\n"
-            "like recall@K, mrr, ndcg@K, accuracy, loss, etc. Prefer BM25 metrics when relevant.\n\n"
-            "Return ONLY valid JSON in this exact format:\n"
-            "{\n"
-            '  "alignments": {"original_key": "reproduced_key"}\n'
-            "}\n\n"
-            f"ORIGINAL: {_json.dumps(orig_sample, ensure_ascii=False)}\n\n"
-            f"REPRODUCED: {_json.dumps(repro_sample, ensure_ascii=False)}\n"
-        )
-        
-        # Call LLM
-        if hasattr(llm_client, '__call__'):
-            response = llm_client(prompt)
-        elif hasattr(llm_client, 'invoke'):
-            response = llm_client.invoke(prompt)
-        else:
-            response = str(llm_client)
-        
-        text = response if isinstance(response, str) else str(response)
-        
-        # Extract JSON
-        match = re.search(r'\{[\s\S]*\}', text)
-        if not match:
-            return {}
-        
-        try:
-            data = _json.loads(match.group(0))
-            alignments = data.get('alignments', {})
-            # Filter to keys that exist
-            filtered = {
-                ok: rk for ok, rk in alignments.items()
-                if ok in original and rk in reproduced
-            }
-            if filtered:
-                self.logger.info(f"✅ LLM aligned {len(filtered)} metrics")
-            return filtered
-        except Exception:
-            return {}
+        return normalized
     
     @staticmethod
-    def _load_extraction_prompt() -> str:
-        import yaml
-        from pathlib import Path
+    def _to_float(value: Any) -> Optional[float]:
+        """
+        Attempt to coerce a metric value to float.
+        Supports numeric types and common string representations (percentages, +/- ranges).
+        """
+        if isinstance(value, (int, float)):
+            return float(value)
         
-        # Find config file relative to this file
-        config_path = Path(__file__).resolve().parents[2] / "config" / "agent_instructions.yaml"
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            
+            # Detect percentages (e.g., "45.8%")
+            is_percent = '%' in text
+            
+            # Remove common decorations
+            cleaned = text.replace('%', '').replace(',', '')
+            
+            # Look for first numeric token
+            match = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', cleaned)
+            if not match:
+                return None
+            
+            try:
+                number = float(match.group(0))
+                if is_percent:
+                    number /= 100.0
+                return number
+            except ValueError:
+                return None
+        
+        return None
+    
+    def _collect_table_metrics(self, tables: Optional[List[Dict[str, Any]]]) -> Dict[str, float]:
+        """
+        Gather metrics that were deterministically extracted from tables.
+        """
+        collected: Dict[str, float] = {}
+        
+        if not tables:
+            return collected
+        
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            
+            table_number = table.get('table_number')
+            prefix = f"Table_{table_number}_" if table_number else ""
+            
+            extracted_metrics = table.get('extracted_metrics') or {}
+            if not isinstance(extracted_metrics, dict):
+                continue
+            
+            for raw_name, raw_value in extracted_metrics.items():
+                if raw_name is None:
+                    continue
+                metric_name = prefix + self._sanitize_metric_key(str(raw_name))
+                value = self._to_float(raw_value)
+                if value is None:
+                    continue
+                collected[metric_name] = value
+        
+        return collected
+    
+    @staticmethod
+    def _sanitize_metric_key(name: str) -> str:
+        """
+        Normalize metric names into filesystem/JSON-friendly keys.
+        """
+        sanitized = re.sub(r'[^A-Za-z0-9@]+', '_', name.strip())
+        sanitized = re.sub(r'_+', '_', sanitized).strip('_')
+        return sanitized or "metric"
+    
+    def _llm_compare(
+        self,
+        paper_metrics: Dict[str, float],
+        reproduced_metrics: Dict[str, float],
+        paper_data: Dict[str, Any],
+        reproduced_data: Dict[str, Any]
+    ) -> ComparisonResult:
+        """
+        Let LLM intelligently compare paper and reproduced metrics.
+        """
+        prompt = f"""Compare these research paper metrics with reproduced experiment results.
+
+PAPER'S REPORTED METRICS:
+{json.dumps(paper_metrics, indent=2)}
+
+REPRODUCED EXPERIMENT METRICS:
+{json.dumps(reproduced_metrics, indent=2)}
+
+Your task:
+1. Match metrics between paper and reproduced results (they may have different names)
+2. For each matched metric, calculate if they're close (within 5-10% is good for most metrics)
+3. Calculate overall reproducibility score (0.0 to 1.0)
+4. Identify likely causes of discrepancies
+5. Provide recommendations
+
+Return ONLY this JSON structure:
+{{
+  "reproducibility_score": 0.85,
+  "metric_comparisons": [
+    {{
+      "metric": "Recall@10",
+      "paper_value": 0.85,
+      "reproduced_value": 0.83,
+      "difference": -0.02,
+      "relative_difference_percent": -2.35,
+      "match": true,
+      "note": "Within acceptable range"
+    }}
+  ],
+  "metrics_matched": 5,
+  "total_metrics_compared": 6,
+  "analysis": "The reproduced results closely match the paper's reported values...",
+  "likely_causes": [
+    "Minor differences due to random seed variation",
+    "Possible differences in library versions"
+  ],
+  "recommendations": [
+    "Results are highly reproducible",
+    "Consider documenting random seed for exact replication"
+  ]
+}}
+
+Guidelines for scoring:
+- 1.0 = Perfect match (all metrics within 1%)
+- 0.9-1.0 = Highly reproducible (within 5%)
+- 0.7-0.9 = Reproducible (within 10%)
+- 0.5-0.7 = Partially reproducible (within 20%)
+- <0.5 = Not reproducible (>20% difference or missing metrics)
+
+Be intelligent about matching:
+- "Recall@10" matches "recall_at_10", "Recall_10", "R@10"
+- "F1" matches "F1-score", "f1_score"
+- Look for semantic similarity, not just exact string matches
+"""
         
         try:
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
-                return config.get('metric_extraction', {}).get('llm_prompt', '')
+            response = self._call_llm(prompt)
+            comparison_data = self._parse_json_response(response)
+            
+            return ComparisonResult(
+                reproducibility_score=float(comparison_data.get('reproducibility_score', 0.0)),
+                metrics_matched=int(comparison_data.get('metrics_matched', 0)),
+                total_metrics_compared=int(comparison_data.get('total_metrics_compared', 0)),
+                metric_comparisons=comparison_data.get('metric_comparisons', []),
+                analysis=comparison_data.get('analysis', ''),
+                likely_causes=comparison_data.get('likely_causes', []),
+                recommendations=comparison_data.get('recommendations', []),
+                paper_metrics=paper_metrics,
+                reproduced_metrics=reproduced_metrics
+            )
         except Exception as e:
-            # Fallback prompt if config can't be loaded
-            return """Extract all numerical metrics from the output below.
-Return ONLY valid JSON: {{"metric_name": value, ...}}
+            self.logger.error(f"Error in LLM comparison: {e}", exc_info=True)
+            # Fallback to simple comparison
+            return self._simple_fallback_comparison(paper_metrics, reproduced_metrics)
+    
+    def _simple_fallback_comparison(
+        self,
+        paper_metrics: Dict[str, float],
+        reproduced_metrics: Dict[str, float]
+    ) -> ComparisonResult:
+        """
+        Simple fallback comparison if LLM fails.
+        """
+        # Try exact key matches first
+        comparisons = []
+        for key in paper_metrics:
+            if key in reproduced_metrics:
+                paper_val = paper_metrics[key]
+                repro_val = reproduced_metrics[key]
+                diff = repro_val - paper_val
+                rel_diff = (abs(diff) / paper_val * 100) if paper_val != 0 else float('inf')
+                
+                comparisons.append({
+                    'metric': key,
+                    'paper_value': paper_val,
+                    'reproduced_value': repro_val,
+                    'difference': diff,
+                    'relative_difference_percent': rel_diff,
+                    'match': rel_diff < 10,
+                    'note': 'Exact key match'
+                })
+        
+        matched = sum(1 for c in comparisons if c['match'])
+        total = len(comparisons) if comparisons else max(len(paper_metrics), len(reproduced_metrics))
+        score = matched / total if total > 0 else 0.0
+        
+        return ComparisonResult(
+            reproducibility_score=score,
+            metrics_matched=matched,
+            total_metrics_compared=total,
+            metric_comparisons=comparisons,
+            analysis="Fallback comparison used (LLM comparison failed)",
+            likely_causes=["Unable to perform detailed analysis"],
+            recommendations=["Review metrics manually"],
+            paper_metrics=paper_metrics,
+            reproduced_metrics=reproduced_metrics
+        )
+    
+    def _call_llm(self, prompt: str) -> str:
+        """
+        Call LLM with prompt and return response text.
+        """
+        if hasattr(self.llm, '__call__'):
+            messages = [{"role": "user", "content": prompt}]
+            response = self.llm(messages)
+        elif hasattr(self.llm, 'invoke'):
+            response = self.llm.invoke(prompt)
+        else:
+            response = str(self.llm)
+        
+        return response if isinstance(response, str) else str(response)
+    
+    def _parse_json_response(self, response: str) -> Dict[str, Any]:
+        """
+        Extract and parse JSON from LLM response.
+        """
+        # Try to find JSON in response
+        json_match = re.search(r'\{[\s\S]*\}', response, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(0))
+            except json.JSONDecodeError as e:
+                self.logger.warning(f"Failed to parse JSON: {e}")
+                # Try to fix common JSON issues
+                json_str = json_match.group(0)
+                # Remove trailing commas
+                json_str = re.sub(r',\s*}', '}', json_str)
+                json_str = re.sub(r',\s*]', ']', json_str)
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    return {}
+        return {}
 
-Output:
-{output_text}"""
+
+# Legacy API for backward compatibility
+class ResultComparator:
+    """Legacy wrapper for backward compatibility."""
+    
+    def __init__(self, thresholds=None):
+        self.logger = logger
+        self.thresholds = thresholds or {}
     
     def extract_metrics(self, output_text: str, llm_client=None) -> Dict[str, float]:
-        # If LLM is available, use intelligent extraction
-        if llm_client:
-            return self._llm_extract_metrics(output_text, llm_client)
+        """Extract metrics using LLM if available."""
+        if not llm_client:
+            return self._basic_extract(output_text)
         
-        # Fallback: Use basic parsing (JSON first, then regex)
-        return self._basic_extract_metrics(output_text)
+        comparator = LLMResultComparator(llm_client)
+        result = comparator._extract_reproduced_metrics({'stdout': output_text})
+        return result
     
-    def _llm_extract_metrics(self, output_text: str, llm_client) -> Dict[str, float]:
-        """
-        Use LLM to intelligently extract metrics from any format.
-        
-        This is much more robust than regex patterns - it can handle:
-        - JSON files (any structure)
-        - Text logs with metrics
-        - Tables (markdown, LaTeX, CSV)
-        - Mixed formats
-        - Abbreviated metric names
-        """
-        
-        # Load prompt template from configuration
-        prompt_template = self._load_extraction_prompt()
-        prompt = prompt_template.format(output_text=output_text[:5000])
-        
-        try:
-            # Use the correct method for smolagents models
-            # The model object is an AzureOpenAIServerModel which expects messages array
-            if hasattr(llm_client, '__call__'):
-                # OpenAI/Azure models expect messages in array format
-                messages = [{"role": "user", "content": prompt}]
-                response = llm_client(messages)
-            elif hasattr(llm_client, 'invoke'):
-                response = llm_client.invoke(prompt)
-            else:
-                # Fallback: try calling directly
-                response = str(llm_client)
-            
-            # Parse the JSON response
-            import json
-            # Try to extract JSON from the response
-            response_text = response if isinstance(response, str) else str(response)
-            
-            # Look for JSON in the response
-            import re
-            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
-            if json_match:
-                metrics = json.loads(json_match.group(0))
-                
-                # Ensure all values are floats
-                metrics = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
-                
-                self.logger.info(f"✅ LLM extracted {len(metrics)} metrics")
-                return metrics
-            else:
-                self.logger.warning("LLM response didn't contain valid JSON, falling back to basic extraction")
-                return self._basic_extract_metrics(output_text)
-                
-        except Exception as e:
-            self.logger.warning(f"LLM extraction failed: {e}, falling back to basic extraction")
-            return self._basic_extract_metrics(output_text)
-    
-    def _basic_extract_metrics(self, output_text: str) -> Dict[str, float]:
-        """
-        Fallback: Basic metric extraction using JSON parsing and regex patterns.
-        Used when LLM is not available or fails.
-        """
-        
+    def _basic_extract(self, text: str) -> Dict[str, float]:
+        """Basic regex extraction as fallback."""
         metrics = {}
         
-        # Try JSON parsing first
+        # Try JSON first
         try:
-            import json
-            data = json.loads(output_text)
-            
-            # Recursively extract all numerical values from JSON with their paths
-            def extract_from_json(obj, prefix=""):
-                if isinstance(obj, dict):
-                    for key, value in obj.items():
-                        new_prefix = f"{prefix}{key}." if prefix else f"{key}."
-                        extract_from_json(value, new_prefix)
-                elif isinstance(obj, list):
-                    # Only extract from first few items to avoid huge lists
-                    for i, item in enumerate(obj[:3]):
-                        extract_from_json(item, f"{prefix}[{i}].")
-                elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
-                    metric_key = prefix.rstrip('.')
-                    metrics[metric_key] = float(obj)
-            
-            extract_from_json(data)
-            self.logger.info(f"Extracted {len(metrics)} metrics from JSON (basic parsing)")
-            return metrics
-            
-        except (json.JSONDecodeError, ValueError):
+            data = json.loads(text)
+            return self._flatten_json(data)
+        except:
             pass
         
-        # Fallback to regex patterns for common metrics
+        # Regex patterns for common metrics
         patterns = {
-            'accuracy': r'accuracy[:\s]*([0-9.]+)',
-            'loss': r'loss[:\s]*([0-9.]+)',
-            'f1': r'f1[:\s]*([0-9.]+)',
-            'precision': r'precision[:\s]*([0-9.]+)',
-            'recall': r'recall[:\s]*([0-9.]+)',
-            'recall@10': r'recall@10[:\s]*([0-9.]+)',
-            'mrr': r'mrr[:\s]*([0-9.]+)',
+            'recall@10': r'recall[@_]10[:\s=]+([0-9.]+)',
+            'recall@50': r'recall[@_]50[:\s=]+([0-9.]+)',
+            'mrr': r'mrr[:\s=]+([0-9.]+)',
+            'accuracy': r'accuracy[:\s=]+([0-9.]+)',
+            'f1': r'f1[:\s=]+([0-9.]+)',
         }
         
-        output_lower = output_text.lower()
-        
-        for metric_name, pattern in patterns.items():
-            matches = re.findall(pattern, output_lower, re.IGNORECASE)
-            if matches:
+        text_lower = text.lower()
+        for metric, pattern in patterns.items():
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
                 try:
-                    metrics[metric_name] = float(matches[-1])
+                    metrics[metric] = float(match.group(1))
                 except ValueError:
-                    continue
+                    pass
         
-        self.logger.info(f"Extracted {len(metrics)} metrics from text (basic regex)")
+        return metrics
+    
+    def _flatten_json(self, obj, prefix='', max_depth=5):
+        """Flatten nested JSON to extract numerical values."""
+        metrics = {}
+        
+        if max_depth == 0:
+            return metrics
+        
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                new_key = f"{prefix}/{key}" if prefix else key
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    metrics[new_key] = float(value)
+                elif isinstance(value, dict):
+                    metrics.update(self._flatten_json(value, new_key, max_depth - 1))
+        
         return metrics
     
     def compare_metrics(
@@ -347,181 +552,50 @@ Output:
         original_metrics: Dict[str, float],
         reproduced_metrics: Dict[str, float],
         llm_client=None
-    ) -> List[MetricComparison]:
-        """
-        Compare two sets of metrics and assess similarity.
+    ) -> List[Dict[str, Any]]:
+        """Compare metrics (legacy API)."""
+        if not llm_client:
+            # Simple exact match comparison
+            comparisons = []
+            for key in original_metrics:
+                if key in reproduced_metrics:
+                    orig = original_metrics[key]
+                    repro = reproduced_metrics[key]
+                    diff = repro - orig
+                    comparisons.append({
+                        'metric': key,
+                        'original': orig,
+                        'reproduced': repro,
+                        'difference': diff,
+                        'match': abs(diff / orig) < 0.1 if orig != 0 else diff == 0
+                    })
+            return comparisons
         
-        1. Match metrics between two runs
-        2. Calculate different similarity measures
-        3. Apply domain-specific thresholds
-        4. Fall back to LLM-driven alignment when keys differ
-        
-        Args:
-            original_metrics: Metrics from original paper
-            reproduced_metrics: Metrics from reproduced run
-            llm_client: Optional LLM for semantic alignment of metric keys
-            
-        Returns:
-            List of MetricComparison objects
-        """
-        
-        comparisons = []
-        
-        # Canonicalize metric keys to maximize matches
-        canonical_original = self._canonicalize_metrics(original_metrics or {})
-        canonical_reproduced = self._canonicalize_metrics(reproduced_metrics or {})
-        
-        # Find common metrics on canonical names
-        common_metrics = set(canonical_original.keys()) & set(canonical_reproduced.keys())
-        
-        # If no overlap, try LLM-driven alignment
-        aligned_pairs: List[Tuple[str, str]] = []
-        if not common_metrics and llm_client:
-            try:
-                alignment = self._llm_align_metrics(canonical_original, canonical_reproduced, llm_client)
-                for orig_key, repro_key in alignment.items():
-                    aligned_pairs.append((orig_key, repro_key))
-            except Exception as e:
-                self.logger.warning(f"LLM alignment failed: {e}")
-        
-        if not common_metrics:
-            self.logger.warning("No common metrics found between original and reproduced")
-        
-        # Build comparisons for direct matches
-        for metric_name in common_metrics:
-            original_value = canonical_original[metric_name]
-            reproduced_value = canonical_reproduced[metric_name]
-            
-            # Calculate differences
-            if original_value == 0:
-                relative_diff = float('inf') if reproduced_value != 0 else 0
-            else:
-                relative_diff = abs(reproduced_value - original_value) / abs(original_value)
-            
-            absolute_diff = abs(reproduced_value - original_value)
-            
-            # Determine if values are close enough
-            threshold = self.thresholds.get(metric_name, self.thresholds['default'])
-            is_close = relative_diff <= threshold
-            
-            # Calculate match score (0-1, where 1 is perfect match)
-            match_score = max(0, 1 - (relative_diff / (2 * threshold)))
-            
-            comparison = MetricComparison(
-                metric_name=metric_name,
-                original_value=original_value,
-                reproduced_value=reproduced_value,
-                absolute_difference=absolute_diff,
-                relative_difference=relative_diff * 100,
-                match_score=match_score,
-                is_close=is_close
-            )
-            
-            comparisons.append(comparison)
-        
-        # Build comparisons for aligned (different) keys
-        for orig_key, repro_key in aligned_pairs:
-            original_value = canonical_original[orig_key]
-            reproduced_value = canonical_reproduced[repro_key]
-            
-            # Calculate differences
-            if original_value == 0:
-                relative_diff = float('inf') if reproduced_value != 0 else 0
-            else:
-                relative_diff = abs(reproduced_value - original_value) / abs(original_value)
-            
-            absolute_diff = abs(reproduced_value - original_value)
-            
-            # Determine if values are close enough
-            threshold = self.thresholds.get(orig_key, self.thresholds['default'])
-            is_close = relative_diff <= threshold
-            
-            # Calculate match score (0-1, where 1 is perfect match)
-            match_score = max(0, 1 - (relative_diff / (2 * threshold)))
-            
-            comparison = MetricComparison(
-                metric_name=orig_key,
-                original_value=original_value,
-                reproduced_value=reproduced_value,
-                absolute_difference=absolute_diff,
-                relative_difference=relative_diff * 100,
-                match_score=match_score,
-                is_close=is_close
-            )
-            
-            comparisons.append(comparison)
-        
-        return comparisons
+        # Use LLM comparator
+        comparator = LLMResultComparator(llm_client)
+        paper_data = {'experimental_results': json.dumps(original_metrics)}
+        reproduced_data = {'metrics': reproduced_metrics}
+        result = comparator.compare_results(paper_data, reproduced_data)
+        return result.metric_comparisons
     
-    def calculate_reproducibility_score(
-        self,
-        comparisons: List[MetricComparison]
-    ) -> float:
-        
+    def calculate_reproducibility_score(self, comparisons: List[Dict[str, Any]]) -> float:
+        """Calculate score from comparisons."""
         if not comparisons:
             return 0.0
-        
-        # Average the match scores
-        total_score = sum(c.match_score for c in comparisons)
-        average_score = total_score / len(comparisons)
-        
-        # Apply bonus for all metrics being close
-        all_close = all(c.is_close for c in comparisons)
-        if all_close:
-            average_score = min(1.0, average_score * 1.1)
-        
-        return average_score
+        matched = sum(1 for c in comparisons if c.get('match', False))
+        return matched / len(comparisons)
     
     def generate_comparison_report(
         self,
-        comparisons: List[MetricComparison],
+        comparisons: List[Dict[str, Any]],
         overall_score: float,
-        additional_info: Optional[Dict[str, Any]] = None
+        additional_info=None
     ) -> Dict[str, Any]:
-        
-        report = {
+        """Generate report (legacy API)."""
+        return {
             'overall_score': overall_score,
             'total_metrics': len(comparisons),
-            'metrics_matched': sum(1 for c in comparisons if c.is_close),
-            'metrics_details': []
+            'metrics_matched': sum(1 for c in comparisons if c.get('match', False)),
+            'comparisons': comparisons,
+            'additional_info': additional_info or {}
         }
-        
-        for comparison in comparisons:
-            report['metrics_details'].append({
-                'metric': comparison.metric_name,
-                'original': comparison.original_value,
-                'reproduced': comparison.reproduced_value,
-                'absolute_diff': comparison.absolute_difference,
-                'relative_diff_percent': comparison.relative_difference,
-                'match_score': comparison.match_score,
-                'is_close': comparison.is_close
-            })
-        
-        if additional_info:
-            report['additional_info'] = additional_info
-        
-        return report
-
-
-def compare_results(
-    original_output: str,
-    reproduced_output: str,
-    custom_thresholds: Optional[Dict[str, float]] = None
-) -> Dict[str, Any]:
-    
-    comparator = ResultComparator(thresholds=custom_thresholds)
-    
-    # Extract metrics
-    original_metrics = comparator.extract_metrics(original_output)
-    reproduced_metrics = comparator.extract_metrics(reproduced_output)
-    
-    # Compare
-    comparisons = comparator.compare_metrics(original_metrics, reproduced_metrics)
-    
-    # Calculate score
-    score = comparator.calculate_reproducibility_score(comparisons)
-    
-    # Generate report
-    report = comparator.generate_comparison_report(comparisons, score)
-    
-    return report

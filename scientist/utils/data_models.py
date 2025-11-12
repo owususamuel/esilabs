@@ -24,6 +24,7 @@ class PaperData(BaseModel):
     
     experimental_results: Optional[str] = None  # Quantitative results: accuracy, F1, BLEU, etc.
     evaluation_metrics: List[str] = Field(default_factory=list)  # Metric names: ["accuracy", "F1", ...]
+    extracted_metrics: Dict[str, float] = Field(default_factory=dict)  # SAVED extracted metrics from paper
     key_findings: Optional[str] = None 
     
     # Metadata

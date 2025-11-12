@@ -9,6 +9,7 @@ from pathlib import Path
 from scientist.agents.base_agent import BaseAgent
 from scientist.tools.pdf_parser import PDFParser, ExperimentalResults, Figure, Table
 from scientist.tools.tool_wrappers import ParsePDF
+from scientist.tools.result_comparator import LLMResultComparator
 
 
 class PaperParserAgent(BaseAgent):
@@ -166,6 +167,15 @@ class PaperParserAgent(BaseAgent):
                     evaluation_metrics = []
                 key_findings = normalize_string_field(extracted_data.get('key_findings', ''))
                 
+                # EXTRACT AND SAVE METRICS from tables/figures using LLM (once, here)
+                self.logger.info("📊 Extracting numerical metrics from paper tables and figures...")
+                extracted_metrics = self._extract_paper_metrics(
+                    experimental_results=experimental_results,
+                    results_summary=results_summary,
+                    evaluation_metrics=evaluation_metrics
+                )
+                self.logger.info(f"✅ Extracted {len(extracted_metrics)} metrics and SAVED to paper data")
+                
                 paper_data = {
                     'title': title,
                     'authors': authors,
@@ -176,6 +186,7 @@ class PaperParserAgent(BaseAgent):
                     'hyperparameters': hyperparams,
                     'experimental_results': results_summary,
                     'evaluation_metrics': evaluation_metrics,
+                    'extracted_metrics': extracted_metrics,  # SAVED metrics
                     'key_findings': key_findings,
                     'pdf_path': pdf_path
                 }
@@ -344,6 +355,50 @@ class PaperParserAgent(BaseAgent):
                 pass
         
         return None
+    
+    def _extract_paper_metrics(
+        self,
+        experimental_results: ExperimentalResults,
+        results_summary: str,
+        evaluation_metrics: List[str]
+    ) -> Dict[str, float]:
+        """
+        Extract numerical metrics from paper using LLM.
+        This happens ONCE during paper parsing, metrics are saved.
+        """
+        try:
+            # Build paper data structure for LLM comparator
+            paper_data = {
+                'experimental_results': results_summary,
+                'tables': [
+                    {
+                        'caption': t.caption,
+                        'content': t.content,
+                        'table_number': t.table_number,
+                        'extracted_metrics': t.metrics or {}
+                    }
+                    for t in experimental_results.tables
+                ],
+                'figures': [
+                    # Figures could be used with vision model in future
+                    {
+                        'caption': f.caption,
+                        'figure_number': f.figure_number
+                    }
+                    for f in experimental_results.figures
+                ],
+                'evaluation_metrics': evaluation_metrics
+            }
+            
+            # Use LLM comparator to extract metrics
+            comparator = LLMResultComparator(llm_client=self.model)
+            metrics = comparator._extract_paper_metrics(paper_data)
+            
+            return metrics
+            
+        except Exception as e:
+            self.logger.warning(f"Could not extract paper metrics: {e}")
+            return {}
 
 
 def parse_paper(pdf_path: str) -> Dict[str, Any]:

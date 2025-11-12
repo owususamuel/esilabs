@@ -244,7 +244,12 @@ class PDFParser:
         return urls
     
     def extract_figures(self, pdf_path: str) -> List[Figure]:
-        """Extract all figures/images from the PDF with their captions."""
+        """Extract all figures/images from the PDF with their captions.
+        
+        Uses two methods:
+        1. Extract embedded images directly (for raster graphics)
+        2. Render page and crop figures (for vector graphics)
+        """
         pdf_path = Path(pdf_path)
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
@@ -275,7 +280,18 @@ class PDFParser:
                             # Skip small images (likely not figures)
                             if width < 100 or height < 100:
                                 continue
-                        except Exception:
+                            
+                            # Check if image is mostly black/empty (vector graphics extraction failure)
+                            if self._is_mostly_black(pil_img):
+                                self.logger.warning(f"Figure {img_index} on page {page_num + 1} appears black - may be vector graphic")
+                                # Try rendering the page instead
+                                rendered_image = self._render_figure_from_page(page, img, xref)
+                                if rendered_image:
+                                    image_bytes = rendered_image
+                                    self.logger.info(f"Successfully re-rendered figure {img_index} from page {page_num + 1}")
+                                    
+                        except Exception as e:
+                            self.logger.debug(f"Error checking image quality: {e}")
                             continue
                         
                         # Try to find caption near this image
@@ -306,6 +322,62 @@ class PDFParser:
             self.logger.error(f"Error extracting figures: {e}")
         
         return figures
+    
+    def _is_mostly_black(self, img: Image.Image, threshold: float = 0.95) -> bool:
+        """Check if an image is mostly black (indicates failed vector graphic extraction)."""
+        try:
+            # Convert to grayscale
+            img_gray = img.convert('L')
+            # Get pixel data
+            pixels = list(img_gray.getdata())
+            total_pixels = len(pixels)
+            
+            # Count pixels that are very dark (< 20 out of 255)
+            dark_pixels = sum(1 for p in pixels if p < 20)
+            
+            # If more than threshold% of pixels are black, it's likely a failed extraction
+            return (dark_pixels / total_pixels) > threshold
+            
+        except Exception as e:
+            self.logger.debug(f"Error checking if image is black: {e}")
+            return False
+    
+    def _render_figure_from_page(self, page, img, xref) -> Optional[bytes]:
+        """Render a figure by rendering the page as image and cropping figure region.
+        
+        This is a fallback for vector graphics that don't extract well directly.
+        """
+        try:
+            # Get the bounding box of the image on the page
+            img_rect = None
+            for item in page.get_images(full=True):
+                if item[0] == xref:
+                    # Get image rectangle from page
+                    img_rects = page.get_image_rects(xref)
+                    if img_rects:
+                        img_rect = img_rects[0]  # Use first occurrence
+                        break
+            
+            if not img_rect:
+                return None
+            
+            # Render the page at higher resolution
+            mat = fitz.Matrix(2.0, 2.0)  # 2x zoom for better quality
+            pix = page.get_pixmap(matrix=mat, clip=img_rect)
+            
+            # Convert to PNG bytes
+            img_bytes = pix.tobytes("png")
+            
+            # Verify the rendered image is not also black
+            pil_img = Image.open(io.BytesIO(img_bytes))
+            if not self._is_mostly_black(pil_img):
+                return img_bytes
+            
+            return None
+            
+        except Exception as e:
+            self.logger.debug(f"Error rendering figure from page: {e}")
+            return None
     
     def _find_figure_caption(self, page_text: str, img_index: int) -> Optional[str]:
         """Try to find the caption for a figure on the page."""
@@ -347,8 +419,10 @@ class PDFParser:
                     
                     # Extract table content (text after caption until next section/table)
                     start_pos = match.end()
-                    # Look for next major delimiter
-                    next_section = re.search(r'(?i)\n(?:figure|table|section|\d+\.)', page_text[start_pos:])
+                    # Look for next major delimiter (but not decimal numbers like 0.4288)
+                    # Match section numbers (e.g., "1. Introduction") or keywords (Figure, Table, Section)
+                    # Require space after period to avoid matching decimals
+                    next_section = re.search(r'(?i)\n(?:figure|table|section|\d+\.\s+[A-Z])', page_text[start_pos:])
                     end_pos = start_pos + (next_section.start() if next_section else min(1000, len(page_text) - start_pos))
                     
                     table_content = page_text[start_pos:end_pos].strip()
@@ -383,8 +457,8 @@ class PDFParser:
         
         for line in lines:
             # Look for patterns like "Method: 0.95" or "Accuracy 89.5%"
-            # Match metric name followed by number
-            pattern = r'([A-Za-z][\\w\\s-]+?)\\s*[:\\s]+\\s*([0-9]+\\.?[0-9]*%?)'
+            # Also look for lines with metric names followed by numbers (even without colons)
+            pattern = r'([A-Za-z][\w\s@-]+?)\s*[:=\s]+\s*([0-9]+\.?[0-9]*%?)'
             matches = re.finditer(pattern, line)
             
             for match in matches:

@@ -582,14 +582,13 @@ class AnalyzePlotSemantics(Tool):
                         }
                     ]
                 
-                # Call vision model
-                response = self.vision_client.chat.completions.create(
-                    model="gpt-4o",  # or another vision-capable model
-                    messages=messages,
-                    max_tokens=1000
-                )
-                
-                analysis = response.choices[0].message.content
+                # Call vision model using smolagents model interface
+                # The model is callable and accepts messages directly
+                try:
+                    response = self.vision_client(messages)
+                    analysis = response if isinstance(response, str) else str(response)
+                except Exception as call_error:
+                    return json.dumps({"error": f"Error calling vision model: {str(call_error)}"})
                 
                 return json.dumps({
                     "success": True,
@@ -627,7 +626,8 @@ class ExtractTableMetrics(Tool):
         },
         "source_type": {
             "type": "string",
-            "description": "Either 'text' or 'image'"
+            "description": "Either 'text' or 'image'",
+            "nullable": True
         }
     }
     output_type = "string"
@@ -648,7 +648,7 @@ class ExtractTableMetrics(Tool):
                 if not img_path.exists():
                     return json.dumps({"error": f"Image not found: {source}"})
                 
-                if self.llm_client and hasattr(self.llm_client, 'chat'):
+                if self.llm_client and callable(self.llm_client):
                     # Use vision model to extract table data
                     with open(img_path, 'rb') as f:
                         image_data = base64.b64encode(f.read()).decode('utf-8')
@@ -661,13 +661,8 @@ class ExtractTableMetrics(Tool):
                         ]
                     }]
                     
-                    response = self.llm_client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=messages,
-                        max_tokens=1000
-                    )
-                    
-                    content = response.choices[0].message.content
+                    response = self.llm_client(messages)
+                    content = response if isinstance(response, str) else str(response)
                     # Try to extract JSON from response
                     import re
                     json_match = re.search(r'\{[^}]+\}', content)
